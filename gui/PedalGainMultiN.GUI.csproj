@@ -1,0 +1,81 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Pedal Gain Multi N — companion WPF GUI for the native machine (Buzz 1503 only).
+
+    Buzz 1503 loads "<MachineDllName>.GUI.dll" from the machine's gear folder
+    and looks for an exported IMachineGUIFactory. The GUI talks to the C++
+    machine via IMachine.SendGUIMessage → HandleGUIMessage.
+
+    Target: net48. Buzz 1503 runs on the .NET Framework 4 CLR and cannot load
+    a .NET 10 assembly — documented exception to the ".NET 10 or higher" rule.
+    Compiled against Buzz 1503's own BuzzGUI.Interfaces.dll.
+
+    Build:
+      dotnet build PedalGainMultiN.GUI.csproj -c Release
+    Override install dir:
+      /p:BuzzDir="D:\Buzz"
+
+    NOTE: AssemblyName must end in ".GUI" (→ "...GUI.dll") so Buzz pairs it
+    with "Pedal Gain Multi N.dll", and must not end in ".NET" (that suffix
+    marks a managed machine).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Pedal Gain Multi N.GUI</AssemblyName>
+    <RootNamespace>WDE.PedalGainMultiN</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <!-- Loads into Buzz 1503's 32-bit process; AnyCPU (as the Buzz wiki
+         recommends for managed Buzz code) runs as 32-bit there. -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Optimize>true</Optimize>
+
+    <!-- Deployment hygiene (mandatory): only the .dll is needed at runtime. -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+
+    <!-- Transitive reference version complaints from host DLLs. -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+
+    <BuzzDir Condition="'$(BuzzDir)' == ''">C:\Program Files (x86)\Jeskola\Buzz</BuzzDir>
+
+    <AssemblyTitle>Pedal Gain Multi N GUI</AssemblyTitle>
+    <Company>WDE</Company>
+    <Product>Pedal Gain Multi N</Product>
+    <Version>1.2.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Buzz 1503's interface assembly — never copied to output. -->
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>$(BuzzDir)\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Lets net48 build without the .NET Framework 4.8 targeting pack installed. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Fail early with a clear message if the host interface DLL is missing. -->
+  <Target Name="CheckHostRefs" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="!Exists('$(BuzzDir)\BuzzGUI.Interfaces.dll')"
+           Text="Buzz 1503 BuzzGUI.Interfaces.dll not found in $(BuzzDir). Set /p:BuzzDir=..." />
+  </Target>
+
+  <!-- ── Deploy: .dll only, to Buzz 1503 ─────────────────────────────────── -->
+  <Target Name="DeployToBuzz1503" AfterTargets="Build">
+    <ItemGroup>
+      <_GuiDll Include="$(TargetPath)" />
+    </ItemGroup>
+    <Message Importance="high" Condition="Exists('$(BuzzDir)\Gear\Effects')"
+             Text="Deploying $(TargetFileName) → $(BuzzDir)\Gear\Effects\" />
+    <Warning Condition="!Exists('$(BuzzDir)\Gear\Effects')"
+             Text="Buzz 1503 gear folder not found ($(BuzzDir)\Gear\Effects) — skipped. Override with /p:BuzzDir=..." />
+    <Copy Condition="Exists('$(BuzzDir)\Gear\Effects')" SourceFiles="@(_GuiDll)"
+          DestinationFolder="$(BuzzDir)\Gear\Effects\" ContinueOnError="true" />
+  </Target>
+
+</Project>

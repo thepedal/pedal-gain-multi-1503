@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pedal Gain Multi N — native Buzz machine (MIF_MULTI_IO)
+
+  32-bit (Win32) only.
+
+  Build (Developer PowerShell for VS):
+    msbuild PedalGainMultiN.vcxproj /p:Configuration=Release /p:Platform=Win32
+
+  Output: "Pedal Gain Multi N.dll"
+
+  Deploy: $(BuzzDir)\Gear\Effects (Buzz 1503 x86 only)
+
+  Deployment hygiene: only the .dll is copied to the gear folders. The .pdb
+  stays in the local bin folder (this is a .vcxproj, so the .csproj
+  DebugType/DebugSymbols/GenerateDependencyFile rule is honoured in spirit
+  by never deploying anything but $(TargetPath)).
+
+  Install dir can be overridden on the command line:
+    /p:BuzzDir="D:\Buzz"
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{6E0B4C7A-2F54-4C1E-9B7D-5A1D3E8C2F61}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>PedalGainMultiN</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <!-- ── Install locations ─────────────────────────────────────────────── -->
+  <PropertyGroup>
+    <BuzzDir    Condition="'$(BuzzDir)' == ''">C:\Program Files (x86)\Jeskola\Buzz</BuzzDir>
+
+    <!-- MachineInterface.h (MI_VERSION 66, the Buzz 1503 interface).
+         Not vendored: it is Oskari Tammelin's header, licensed for writing
+         freeware Buzz machines. Fetched on first build (from the ReBuzz repo,
+         which carries the MI_VERSION 66 copy — source only, no ReBuzz dependency),
+         pinned to a known commit. Or drop your own copy into sdk\. -->
+    <BuzzSdkDir Condition="'$(BuzzSdkDir)' == ''">$(MSBuildProjectDirectory)\sdk</BuzzSdkDir>
+    <MachineInterfaceUrl>https://raw.githubusercontent.com/wasteddesign/ReBuzz/a87079863d904d928456c0ca29057c208af65a32/3rdParty/Buzz/MachineInterface.h</MachineInterfaceUrl>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)' == 'Debug'">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)' == 'Release'">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <TargetName>Pedal Gain Multi N</TargetName>
+    <OutDir>$(MSBuildProjectDirectory)\bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(BuzzSdkDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- MachineInterface.h declares host-implemented virtuals without bodies; harmless. -->
+      <DisableSpecificWarnings>4100;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Static CRT: no msvcr*/vcruntime DLL dependency on the user's machine
+       (a common cause of "machine won't load" in classic Buzz). -->
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <!-- Buzz 1503 x86 predates universal AVX; keep the build on SSE2. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="PedalGainMultiN.cpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- ── Fetch MachineInterface.h if missing ───────────────────────────── -->
+  <Target Name="FetchMachineInterface" BeforeTargets="PrepareForBuild"
+          Condition="!Exists('$(BuzzSdkDir)\MachineInterface.h')">
+    <Message Importance="high" Text="MachineInterface.h not found in $(BuzzSdkDir) — downloading pinned copy" />
+    <DownloadFile SourceUrl="$(MachineInterfaceUrl)" DestinationFolder="$(BuzzSdkDir)" />
+  </Target>
+
+  <!-- ── Guard: 32-bit only ──────────────────────────────────────────── -->
+  <Target Name="Require32Bit" BeforeTargets="PrepareForBuild" Condition="'$(Platform)' != 'Win32'">
+    <Error Text="Pedal Gain Multi N is 32-bit only. Build with /p:Platform=Win32." />
+  </Target>
+
+  <!-- ── Deploy: .dll only, to Buzz 1503 ─────────────────────────────── -->
+  <Target Name="DeployNativeMachine" AfterTargets="Build">
+    <ItemGroup>
+      <_MachineDll Include="$(TargetPath)" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_BuzzGear>$(BuzzDir)\Gear\Effects</_BuzzGear>
+    </PropertyGroup>
+
+    <!-- Buzz 1503 (x86) -->
+    <Message Importance="high" Condition="Exists('$(_BuzzGear)')"
+             Text="Deploying $(TargetFileName) → $(_BuzzGear)\" />
+    <Warning Condition="!Exists('$(_BuzzGear)')"
+             Text="Buzz gear folder not found ($(_BuzzGear)) — skipped. Override with /p:BuzzDir=..." />
+    <Copy Condition="Exists('$(_BuzzGear)')" SourceFiles="@(_MachineDll)"
+          DestinationFolder="$(_BuzzGear)\" ContinueOnError="true" />
+
+  </Target>
+
+</Project>
