@@ -20,6 +20,12 @@
 //     fader on the OUT row. All bound to parameters; the machine smooths
 //     every level change.
 //   • v1.3.1: per-row MO (Mono) toggle.
+//   • v1.4: VOL and master faders are dB faders with a console taper
+//     (unity at 75 % of travel); wheel steps are 1 dB / 0.5 dB.
+//   • v1.5: meters get exact peaks since the last poll (protocol v3); IEC-
+//     style fall (≈ 11.8 dB/s) timed by the clock; 3 s peak hold; latching
+//     clip lights (click any meter to clear); PRE/POST channel metering;
+//     the master shows true peak.
 //
 // Renders a compact meter stack at the top of the parameters window:
 //
@@ -76,7 +82,7 @@ namespace WDE.PedalGainMultiN
 
         // ── GUI message protocol (must match PedalGainMultiN.cpp) ────────────
         const int GUIMSG_GET_METERS    = 1;
-        const int GUI_PROTOCOL_VERSION = 2;   // v2: + channel count
+        const int GUI_PROTOCOL_VERSION = 3;   // v3: peaks since last poll, pre+post per channel, master true peak
         static readonly byte[] MeterRequest = BitConverter.GetBytes(GUIMSG_GET_METERS);
 
         IMachine imachine;
@@ -92,10 +98,15 @@ namespace WDE.PedalGainMultiN
         readonly MiniFader[] panFaders = new MiniFader[MaxChannels];
         MiniFader masterFader;
 
-        // Latest meter snapshot from the native side (1.0 == 0 dBFS).
-        readonly float[] meterIn = new float[MaxChannels];
-        float meterL, meterR;
+        // Peaks since the previous poll from the native side (1.0 == 0 dBFS).
+        readonly float[] prePeak  = new float[MaxChannels];
+        readonly float[] postPeak = new float[MaxChannels];
+        float tpPeakL, tpPeakR;
         bool  meterLinkOk = true;
+        bool  discardNextPoll = true;    // first reply after (re)open may hold stale peaks
+        bool  postFader;                 // channel meters: false = PRE, true = POST
+        readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
+        double lastTickSeconds;
 
         public IMachine Machine
         {
@@ -103,6 +114,7 @@ namespace WDE.PedalGainMultiN
             set
             {
                 imachine = value;
+                discardNextPoll = true;
                 CacheParameters();
             }
         }
@@ -116,18 +128,13 @@ namespace WDE.PedalGainMultiN
         readonly TextBlock[] soloLabels    = new TextBlock[MaxChannels];
         readonly Border[]    monoButtons   = new Border[MaxChannels];
         readonly TextBlock[] monoLabels    = new TextBlock[MaxChannels];
-        readonly Rectangle[] inBars        = new Rectangle[MaxChannels];
-        readonly Rectangle[] inPeakLines   = new Rectangle[MaxChannels];
-        readonly TextBlock[] inDbTexts     = new TextBlock[MaxChannels];
-        readonly float[]     inHoldDb      = new float[MaxChannels];
-        readonly int[]       inHoldFrames  = new int[MaxChannels];
+        readonly MeterView[] inMeters      = new MeterView[MaxChannels];
 
-        // Output widgets
-        Rectangle barL,  barR;
-        Rectangle peakL, peakR;
-        TextBlock dbTextL, dbTextR;
-        float holdDbL = DB_MIN, holdDbR = DB_MIN;
-        int   holdFramesL,      holdFramesR;
+        // Output (master, true-peak) meters
+        MeterView outMeterL, outMeterR;
+
+        // PRE/POST switch label in the IN header
+        TextBlock prePostLabel;
 
         // Mute widgets (single button gating the whole output)
         Border    muteButton;
@@ -144,11 +151,17 @@ namespace WDE.PedalGainMultiN
         const float MONO_W    = 26f;   // channel Mono toggle column
         const float H         = 9f;
         const float DB_MIN    = -60f;
-        const int   HOLD_FRAMES = 90;   // ~3 s at 33 ms/frame
+
+        // Ballistics: IEC 60268-18 style digital peak meter — instant attack,
+        // fall 20 dB in ~1.7 s (≈ 11.8 dB/s). Peak hold: 3 s, then falls at
+        // the same rate. Clip lights latch at >= 0 dBFS until cleared.
+        const double FALL_DB_PER_S = 20.0 / 1.7;
+        const double HOLD_SECONDS  = 3.0;
 
         // ── Cached, frozen brushes ───────────────────────────────────────────
         static readonly Brush TrackBrush     = Freeze(new SolidColorBrush(Color.FromRgb(34,  34,  38)));
         static readonly Brush PeakBrush      = Freeze(new SolidColorBrush(Colors.White));
+        static readonly Brush ClipBrush      = Freeze(new SolidColorBrush(Color.FromRgb(235,  45,  35)));
         static readonly Brush LabelColor     = Freeze(new SolidColorBrush(Color.FromRgb(170, 170, 180)));
         static readonly Brush ScaleColor     = Freeze(new SolidColorBrush(Color.FromRgb(95,  95, 105)));
         static readonly Brush SectionColor   = Freeze(new SolidColorBrush(Color.FromRgb(120, 120, 135)));
@@ -203,7 +216,7 @@ namespace WDE.PedalGainMultiN
                 Interval = TimeSpan.FromMilliseconds(33)   // ~30 fps
             };
             timer.Tick += Tick;
-            Loaded   += (_, __) => { meterLinkOk = true; timer.Start(); };
+            Loaded   += (_, __) => { meterLinkOk = true; discardNextPoll = true; timer.Start(); };
             Unloaded += (_, __) => timer.Stop();
         }
 
@@ -258,8 +271,8 @@ namespace WDE.PedalGainMultiN
             // directly under the column of solo buttons above.
             root.Children.Add(BuildOutHeaderRow());
 
-            (barL, peakL, dbTextL) = AddOutputRow(root, "L", grad);
-            (barR, peakR, dbTextR) = AddOutputRow(root, "R", grad);
+            outMeterL = AddOutputRow(root, "L", grad);
+            outMeterR = AddOutputRow(root, "R", grad);
 
             root.Children.Add(MakeScaleRow());
 
@@ -313,25 +326,16 @@ namespace WDE.PedalGainMultiN
                 num.ToolTip = $"In {i} (track {i}) — its direct out is output plug {i + 1} (Direct In {i}); plug 0 is the master mix";
                 grid.Children.Add(num);
 
-                // Col 3 — bar canvas + peak-hold line.
-                var (canvas, bar, peak) = BuildBarCanvas(levelBrush);
-                Grid.SetColumn(canvas, 3);
-                grid.Children.Add(canvas);
-                inBars[i]      = bar;
-                inPeakLines[i] = peak;
-
-                // Col 4 — dB readout.
-                var db = RowReadout();
-                Grid.SetColumn(db, 4);
-                grid.Children.Add(db);
-                inDbTexts[i] = db;
-
-                inHoldDb[i]     = DB_MIN;
-                inHoldFrames[i] = 0;
+                // Col 3 — meter bar (+ hold line, clip light); col 4 — held-peak readout.
+                var meter = BuildMeter(levelBrush);
+                Grid.SetColumn(meter.Canvas, 3);
+                grid.Children.Add(meter.Canvas);
+                Grid.SetColumn(meter.Readout, 4);
+                grid.Children.Add(meter.Readout);
+                inMeters[i] = meter;
 
                 // Col 5 — channel fader (Volume), col 6 — balance (Pan).
-                var vol = new MiniFader(FADER_W - 8, H, bipolar: false, fill: FaderBrush,
-                                        param: () => volumeParam, track: track);
+                var vol = LevelFader(FADER_W - 8, H, () => volumeParam, track);
                 Grid.SetColumn(vol.Root, 5);
                 grid.Children.Add(vol.Root);
                 volFaders[i] = vol;
@@ -382,6 +386,40 @@ namespace WDE.PedalGainMultiN
             buttons.Children.Add(MakeActionButton("+", "Add a channel (track), up to 24",  () => ChangeChannelCount(+1)));
             Grid.SetColumn(buttons, 3);
             grid.Children.Add(buttons);
+
+            // Col 4 — PRE/POST switch for the channel meters.
+            prePostLabel = new TextBlock
+            {
+                Text                = "PRE",
+                FontFamily          = Mono,
+                FontSize            = 8,
+                FontWeight          = FontWeights.Bold,
+                Foreground          = SoloOffFg,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment   = VerticalAlignment.Center
+            };
+            var prePost = new Border
+            {
+                Width           = READOUT_W - 10,
+                Height          = H + 2,
+                Margin          = new Thickness(6, 0, 0, 0),
+                Background      = SoloOffBg,
+                BorderBrush     = SoloBorder,
+                BorderThickness = new Thickness(1),
+                CornerRadius    = new CornerRadius(2),
+                Cursor          = Cursors.Hand,
+                ToolTip         = "Channel meters: PRE = raw input, POST = after Mono, Mute, Volume and Pan",
+                Child           = prePostLabel
+            };
+            prePost.MouseLeftButtonDown += (_, e) =>
+            {
+                postFader = !postFader;
+                prePostLabel.Text = postFader ? "POST" : "PRE";
+                for (int i = 0; i < MaxChannels; i++) inMeters[i]?.Reset();
+                e.Handled = true;
+            };
+            Grid.SetColumn(prePost, 4);
+            grid.Children.Add(prePost);
 
             var volHdr = SectionHeader("VOL");
             ((FrameworkElement)volHdr).Margin = new Thickness(6, 1, 0, 1);
@@ -464,7 +502,7 @@ namespace WDE.PedalGainMultiN
             // The "OUT" label lives in col 2, styled to match the IN header.
             var hdr = new TextBlock
             {
-                Text              = "OUT (MASTER)",
+                Text              = "OUT (MASTER, TRUE PEAK)",
                 FontFamily        = Mono,
                 FontSize          = 8,
                 Foreground        = SectionColor,
@@ -474,8 +512,7 @@ namespace WDE.PedalGainMultiN
             grid.Children.Add(hdr);
 
             // Col 5 — master fader (Gain, output 0 only).
-            masterFader = new MiniFader(FADER_W - 8, H, bipolar: false, fill: FaderBrush,
-                                        param: () => gainParam, track: 0);
+            masterFader = LevelFader(FADER_W - 8, H, () => gainParam, 0);
             Grid.SetColumn(masterFader.Root, 5);
             grid.Children.Add(masterFader.Root);
 
@@ -508,17 +545,21 @@ namespace WDE.PedalGainMultiN
             Margin            = new Thickness(4, 0, 0, 0)
         };
 
-        // Build the bar canvas used by every meter row.
-        static (Canvas canvas, Rectangle bar, Rectangle peak)
-            BuildBarCanvas(Brush fill)
+        // Build one meter: bar canvas (track, level bar, hold line, clip light)
+        // plus its readout. Clicking any meter clears every hold and clip light.
+        MeterView BuildMeter(Brush fill)
         {
-            var canvas = new Canvas { Width = W, Height = H, ClipToBounds = true };
+            var canvas = new Canvas
+            {
+                Width = W, Height = H, ClipToBounds = true,
+                Cursor = Cursors.Hand,
+                ToolTip = "Click to clear peak holds and clip lights"
+            };
 
-            var track = new Rectangle
+            canvas.Children.Add(new Rectangle
             {
                 Width = W, Height = H, Fill = TrackBrush, RadiusX = 1.5, RadiusY = 1.5
-            };
-            canvas.Children.Add(track);
+            });
 
             var bar = new Rectangle
             {
@@ -528,37 +569,101 @@ namespace WDE.PedalGainMultiN
             Canvas.SetTop(bar, 0);
             canvas.Children.Add(bar);
 
-            var peak = new Rectangle
-            {
-                Width = 2, Height = H, Fill = PeakBrush, Opacity = 0
-            };
-            Canvas.SetTop(peak, 0);
-            canvas.Children.Add(peak);
+            var hold = new Rectangle { Width = 2, Height = H, Fill = PeakBrush, Opacity = 0 };
+            Canvas.SetTop(hold, 0);
+            canvas.Children.Add(hold);
 
-            return (canvas, bar, peak);
+            // Clip light: a red cap at the 0 dBFS end of the bar.
+            var clip = new Rectangle { Width = 4, Height = H, Fill = ClipBrush, Opacity = 0 };
+            Canvas.SetLeft(clip, W - 4);
+            Canvas.SetTop(clip, 0);
+            canvas.Children.Add(clip);
+
+            canvas.MouseLeftButtonDown += (_, e) => { ResetAllMeters(); e.Handled = true; };
+
+            return new MeterView(canvas, bar, hold, clip, RowReadout());
         }
 
-        // Helper used for the output L / R rows — no toggle buttons, same
-        // grid so the bar column still aligns pixel-for-pixel with the
-        // input rows.
-        (Rectangle bar, Rectangle peak, TextBlock db)
-            AddOutputRow(Panel parent, string label, Brush fill)
+        void ResetAllMeters()
+        {
+            for (int i = 0; i < MaxChannels; i++)
+                inMeters[i]?.Reset();
+            outMeterL?.Reset();
+            outMeterR?.Reset();
+        }
+
+        // Output L / R rows — same grid so the bar column aligns with the inputs.
+        MeterView AddOutputRow(Panel parent, string label, Brush fill)
         {
             var grid = MakeRowGrid();
             grid.Margin = new Thickness(0, 1, 0, 1);
 
-            grid.Children.Add(RowLabel(label, col: 2));
+            var lbl = RowLabel(label, col: 2);
+            lbl.ToolTip = "Master output, true peak (4x oversampled)";
+            grid.Children.Add(lbl);
 
-            var (canvas, bar, peak) = BuildBarCanvas(fill);
-            Grid.SetColumn(canvas, 3);
-            grid.Children.Add(canvas);
-
-            var db = RowReadout();
-            Grid.SetColumn(db, 4);
-            grid.Children.Add(db);
+            var meter = BuildMeter(fill);
+            Grid.SetColumn(meter.Canvas, 3);
+            grid.Children.Add(meter.Canvas);
+            Grid.SetColumn(meter.Readout, 4);
+            grid.Children.Add(meter.Readout);
 
             parent.Children.Add(grid);
-            return (bar, peak, db);
+            return meter;
+        }
+
+        // ── MeterView — one meter's widgets + ballistics ──────────────────────
+        // Fed with the exact peak since the previous poll; handles fall-back,
+        // peak hold and the latching clip light using real elapsed time.
+        sealed class MeterView
+        {
+            public readonly Canvas    Canvas;
+            public readonly TextBlock Readout;
+            readonly Rectangle bar, hold, clip;
+
+            double levelDb = DB_MIN, holdDb = DB_MIN, holdAge;
+            bool   clipped;
+            string shownText;
+            bool   shownClip;
+
+            public MeterView(Canvas canvas, Rectangle bar, Rectangle hold, Rectangle clip, TextBlock readout)
+            {
+                Canvas = canvas; this.bar = bar; this.hold = hold; this.clip = clip; Readout = readout;
+            }
+
+            public void Reset()
+            {
+                holdDb  = DB_MIN;
+                holdAge = 0;
+                clipped = false;
+            }
+
+            public void Update(float peakLin, double dt)
+            {
+                double pk = LinToDb(peakLin);
+                double fall = FALL_DB_PER_S * dt;
+
+                levelDb = Math.Max(pk, Math.Max(levelDb - fall, DB_MIN));
+
+                if (pk >= holdDb) { holdDb = pk; holdAge = 0; }
+                else if ((holdAge += dt) > HOLD_SECONDS)
+                    holdDb = Math.Max(holdDb - fall, DB_MIN);
+
+                if (peakLin >= 1.0f) clipped = true;
+
+                bar.Width = Clamp(Norm((float)levelDb) * W, 0f, W);
+                Canvas.SetLeft(hold, Clamp(Norm((float)holdDb) * W - 1f, 0f, W - 2f));
+                hold.Opacity = holdDb > DB_MIN + 0.5 ? 1.0 : 0.0;
+                clip.Opacity = clipped ? 1.0 : 0.0;
+
+                string text = FormatDb((float)holdDb);
+                if (text != shownText) { Readout.Text = text; shownText = text; }
+                if (clipped != shownClip)
+                {
+                    Readout.Foreground = clipped ? ClipBrush : LabelColor;
+                    shownClip = clipped;
+                }
+            }
         }
 
         // Scale row re-uses MakeRowGrid so column 3 matches the bar widths
@@ -639,6 +744,54 @@ namespace WDE.PedalGainMultiN
             return (btn, text);
         }
 
+        // ── Fader taper (Gain / Volume) ──────────────────────────────────────
+        // Parameter codes: 0 = -inf, c = (c - 161) × 0.5 dB, 181 = +10 dB.
+        // Travel follows a console-style curve: unity at 75 %, -20 dB at 42 %,
+        // -40 dB at 20 %, so the useful mixing range gets most of the fader.
+        static class Taper
+        {
+            const int    UNITY = 161, MAX = 181;
+            const double STEP_DB = 0.5, MIN_FRAC = 0.01;   // below MIN_FRAC → -inf
+
+            static readonly double[] Db   = { -80, -60, -40, -30, -20, -10,  -5,    0,    5,   10 };
+            static readonly double[] Frac = { 0.02, 0.08, 0.20, 0.30, 0.42, 0.60, 0.68, 0.75, 0.87, 1.00 };
+
+            public static double ToFrac(int code)
+            {
+                if (code <= 0) return 0;
+                if (code > MAX) code = MAX;
+                double db = (code - UNITY) * STEP_DB;
+                for (int i = 1; i < Db.Length; i++)
+                    if (db <= Db[i])
+                        return Frac[i - 1] + (db - Db[i - 1]) / (Db[i] - Db[i - 1]) * (Frac[i] - Frac[i - 1]);
+                return 1;
+            }
+
+            public static int FromFrac(double f)
+            {
+                if (f < MIN_FRAC) return 0;
+                double db;
+                if (f <= Frac[0]) db = Db[0];
+                else
+                {
+                    db = Db[Db.Length - 1];
+                    for (int i = 1; i < Frac.Length; i++)
+                        if (f <= Frac[i])
+                        {
+                            db = Db[i - 1] + (f - Frac[i - 1]) / (Frac[i] - Frac[i - 1]) * (Db[i] - Db[i - 1]);
+                            break;
+                        }
+                }
+                int code = UNITY + (int)Math.Round(db / STEP_DB);
+                return code < 1 ? 1 : (code > MAX ? MAX : code);
+            }
+        }
+
+        static MiniFader LevelFader(double width, double height, Func<IParameter> param, int track) =>
+            new MiniFader(width, height, bipolar: false, fill: FaderBrush, param: param, track: track,
+                          toFrac: Taper.ToFrac, fromFrac: Taper.FromFrac,
+                          wheelStep: 2, fineStep: 1, hint: "wheel ±1 dB (Ctrl ±0.5 dB)");
+
         // ── MiniFader — compact horizontal fader bound to one parameter/track ──
         //
         //   drag            set value (the parameter is the source of truth)
@@ -655,17 +808,29 @@ namespace WDE.PedalGainMultiN
             readonly int       track;
             readonly bool      bipolar;
             readonly double    width;
+            readonly Func<int, double> toFrac;     // value → 0..1 travel (null = linear)
+            readonly Func<double, int> fromFrac;   // 0..1 travel → value
+            readonly int       wheelStep, fineStep;
+            readonly string    hint;
             readonly Rectangle fill;
             readonly Rectangle defaultTick;
             int shownValue = int.MinValue;
 
             public MiniFader(double width, double height, bool bipolar, Brush fill,
-                             Func<IParameter> param, int track)
+                             Func<IParameter> param, int track,
+                             Func<int, double> toFrac = null, Func<double, int> fromFrac = null,
+                             int wheelStep = 5, int fineStep = 1,
+                             string hint = "wheel ±5 (Ctrl ±1)")
             {
-                this.width   = width;
-                this.bipolar = bipolar;
-                this.param   = param;
-                this.track   = track;
+                this.width     = width;
+                this.bipolar   = bipolar;
+                this.param     = param;
+                this.track     = track;
+                this.toFrac    = toFrac;
+                this.fromFrac  = fromFrac;
+                this.wheelStep = wheelStep;
+                this.fineStep  = fineStep;
+                this.hint      = hint;
 
                 Root = new Canvas
                 {
@@ -713,7 +878,7 @@ namespace WDE.PedalGainMultiN
                 {
                     var p = param();
                     if (p == null) return;
-                    int step = (Keyboard.Modifiers & ModifierKeys.Control) != 0 ? 1 : 5;
+                    int step = (Keyboard.Modifiers & ModifierKeys.Control) != 0 ? this.fineStep : this.wheelStep;
                     Set(p.GetValue(track) + (e.Delta > 0 ? step : -step));
                     e.Handled = true;
                 };
@@ -726,7 +891,9 @@ namespace WDE.PedalGainMultiN
                 double frac = x / width;
                 if (frac < 0) frac = 0;
                 if (frac > 1) frac = 1;
-                Set(p.MinValue + (int)Math.Round(frac * (p.MaxValue - p.MinValue)));
+                Set(fromFrac != null
+                    ? fromFrac(frac)
+                    : p.MinValue + (int)Math.Round(frac * (p.MaxValue - p.MinValue)));
             }
 
             void Set(int v)
@@ -741,7 +908,8 @@ namespace WDE.PedalGainMultiN
             }
 
             double XOf(IParameter p, int v) =>
-                p.MaxValue > p.MinValue ? (double)(v - p.MinValue) / (p.MaxValue - p.MinValue) * width : 0;
+                toFrac != null ? toFrac(v) * width
+                : p.MaxValue > p.MinValue ? (double)(v - p.MinValue) / (p.MaxValue - p.MinValue) * width : 0;
 
             public void Refresh()
             {
@@ -770,7 +938,7 @@ namespace WDE.PedalGainMultiN
                 string desc = null;
                 try { desc = p.DescribeValue(v); } catch { }
                 Root.ToolTip = $"{p.Name}: {(string.IsNullOrEmpty(desc) ? v.ToString() : desc)}" +
-                               "\nDrag to set · double-click to reset · wheel ±5 (Ctrl ±1)";
+                               "\nDrag to set · double-click to reset · " + hint;
             }
         }
 
@@ -848,6 +1016,9 @@ namespace WDE.PedalGainMultiN
         // freezes the meters; it never throws into the dispatcher.
         void PollMeters()
         {
+            for (int i = 0; i < MaxChannels; i++) { prePeak[i] = 0; postPeak[i] = 0; }
+            tpPeakL = tpPeakR = 0;
+
             if (imachine == null || !meterLinkOk) return;
 
             byte[] r;
@@ -859,16 +1030,23 @@ namespace WDE.PedalGainMultiN
 
             int channels = BitConverter.ToInt32(r, 4);
             if (channels < 1 || channels > MaxChannels) return;
-            if (r.Length < 8 + 4 * (channels + 2)) return;
+            if (r.Length < 8 + 4 * (2 * channels + 2)) return;
 
             if (channels != shownChannels)
                 BuildInputRows(channels);
 
+            // Reading resets the machine's peaks. The first reply after the
+            // window opens can hold peaks from long ago, so drop it.
+            if (discardNextPoll) { discardNextPoll = false; return; }
+
             int o = 8;
-            for (int i = 0; i < channels; i++, o += 4)
-                meterIn[i] = BitConverter.ToSingle(r, o);
-            meterL = BitConverter.ToSingle(r, o); o += 4;
-            meterR = BitConverter.ToSingle(r, o);
+            for (int i = 0; i < channels; i++, o += 8)
+            {
+                prePeak[i]  = BitConverter.ToSingle(r, o);
+                postPeak[i] = BitConverter.ToSingle(r, o + 4);
+            }
+            tpPeakL = BitConverter.ToSingle(r, o);
+            tpPeakR = BitConverter.ToSingle(r, o + 4);
         }
 
         // ── Meter math ───────────────────────────────────────────────────────
@@ -885,24 +1063,9 @@ namespace WDE.PedalGainMultiN
 
         // Format a dB value for the meter readout. -∞ is shown when the
         // value is at or below the noise floor. Used to display the held
-        // peak (UpdateHold tracks its value in dB, not linear).
+        // peak (the hold is tracked in dB, not linear).
         static string FormatDb(float db) =>
-            db <= DB_MIN + 0.5f ? "-∞" : $"{db:F1}";
-
-        void SetBar(Rectangle bar, float lin)
-        {
-            bar.Width = Clamp(Norm(LinToDb(lin)) * W, 0f, W);
-        }
-
-        void UpdateHold(ref float holdDb, ref int frames, float currentDb, Rectangle line)
-        {
-            if (currentDb >= holdDb) { holdDb = currentDb; frames = 0; }
-            else if (++frames > HOLD_FRAMES)
-                holdDb = Math.Max(holdDb - 0.4f, DB_MIN);
-
-            Canvas.SetLeft(line, Clamp(Norm(holdDb) * W - 1f, 0f, W - 2f));
-            line.Opacity = holdDb > DB_MIN + 0.5f ? 1.0 : 0.0;
-        }
+            db <= DB_MIN + 0.5f ? "-∞" : (db > 0.05f ? $"+{db:F1}" : $"{db:F1}");
 
         // ── Timer tick ───────────────────────────────────────────────────────
         void Tick(object sender, EventArgs e)
@@ -912,13 +1075,15 @@ namespace WDE.PedalGainMultiN
 
             PollMeters();
 
+            double now = clock.Elapsed.TotalSeconds;
+            double dt  = now - lastTickSeconds;
+            lastTickSeconds = now;
+            if (dt < 0 || dt > 0.25) dt = 0.25;   // window hidden / timer stalled
+
             // Per-input meters + solo / mute button state.
             for (int i = 0; i < shownChannels; i++)
             {
-                float v = meterIn[i];
-                SetBar(inBars[i], v);
-                UpdateHold(ref inHoldDb[i], ref inHoldFrames[i], LinToDb(v), inPeakLines[i]);
-                inDbTexts[i].Text = FormatDb(inHoldDb[i]);
+                inMeters[i]?.Update(postFader ? postPeak[i] : prePeak[i], dt);
 
                 // Refresh toggle buttons — the parameters are the source of
                 // truth (click handler, pattern editor, song load all land there).
@@ -938,17 +1103,9 @@ namespace WDE.PedalGainMultiN
             }
             masterFader?.Refresh();
 
-            // Stereo output meter — hold-synchronized readout.
-            float l = meterL;
-            float r = meterR;
-
-            SetBar(barL, l);
-            UpdateHold(ref holdDbL, ref holdFramesL, LinToDb(l), peakL);
-            dbTextL.Text = FormatDb(holdDbL);
-
-            SetBar(barR, r);
-            UpdateHold(ref holdDbR, ref holdFramesR, LinToDb(r), peakR);
-            dbTextR.Text = FormatDb(holdDbR);
+            // Master output — true peak.
+            outMeterL?.Update(tpPeakL, dt);
+            outMeterR?.Update(tpPeakR, dt);
         }
     }
 }

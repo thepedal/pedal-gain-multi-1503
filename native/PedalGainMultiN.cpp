@@ -18,7 +18,22 @@
 //
 //   All level controls (Gain, Volume, Pan) and the Mono switch glide to new
 //   values (~10 ms smoothing) so automation and slider moves don't click.
-//   Mutes keep their own Inertia fade.
+//   Mutes and solos fade over the Inertia time.
+//
+// v1.4 — console-standard level behaviour
+//   • Gain and Volume are decibel faders: 0 = -inf, 1..181 = -80..+10 dB in
+//     0.5 dB steps, 161 = 0 dB (unity). (v1.3 used linear percent.)
+//   • Solo now fades with Inertia, like mute (v1.3 switched instantly).
+//   • Pan on a Mono channel is a constant-power panner (-3 dB per side at
+//     centre); stereo channels keep the balance law.
+//
+// v1.5 — metering
+//   • Meters report the exact peak since the GUI's last poll (no peaks lost
+//     between polls); ballistics, hold and clip latching live in the GUI.
+//   • Channels report both pre-fader (raw input) and post-fader (after Mono,
+//     Mute, Volume, Pan) peaks; the GUI's PRE/POST switch picks one.
+//   • The master reports TRUE PEAK: 4x oversampled with a 48-tap windowed-sinc
+//     interpolator (BS.1770-style), catching inter-sample peaks.
 //
 //   • Peak meters (inputs pre-fader, master L/R) exposed to the companion
 //     "Pedal Gain Multi N.GUI.dll" via HandleGUIMessage
@@ -43,14 +58,83 @@ static int const PAN_MAX    = 128;
 
 // Machine data written by Save(). Its presence in Init() marks a machine that
 // is being loaded (song, template, clone) rather than freshly created.
-static byte const SAVE_VERSION = 1;
+static byte const SAVE_VERSION = 2;     // 2 = v1.4 (dB fader encoding)
+
+// ── Fader encoding (Gain and Volume) ─────────────────────────────────────
+// 0 = -inf; code c in 1..LEVEL_MAX = (c - LEVEL_UNITY) * 0.5 dB.
+static int   const LEVEL_UNITY = 161;       //   0.0 dB
+static int   const LEVEL_MAX   = 181;       // +10.0 dB
+static float const LEVEL_STEP_DB = 0.5f;
+
+static float LevelDb(int code) { return (code - LEVEL_UNITY) * LEVEL_STEP_DB; }
+
+static float g_levelTable[LEVEL_MAX + 1];   // code → linear gain
+
+static void InitLevelTable()
+{
+    static bool done = false;
+    if (done) return;
+    g_levelTable[0] = 0.0f;
+    for (int c = 1; c <= LEVEL_MAX; c++)
+        g_levelTable[c] = powf(10.0f, LevelDb(c) / 20.0f);
+    done = true;
+}
+
+static inline float LevelGain(int code)
+{
+    if (code <= 0)        return 0.0f;
+    if (code > LEVEL_MAX) code = LEVEL_MAX;
+    return g_levelTable[code];
+}
 
 // ── GUI message protocol (shared with PedalGainMultiNGUI.cs) ───────────────
 // Request : int32 message id
-// Reply   : GUIMSG_GET_METERS → int32 protocol version (2), int32 channel count N,
-//           float MeterIn[N], float MeterL, float MeterR     (master out)
+// Reply   : GUIMSG_GET_METERS → int32 protocol version (3), int32 channel count N,
+//           N × { float prePeak, float postPeak }, float truePeakL, float truePeakR
+//           All values are linear (1.0 = 0 dBFS) peaks since the previous poll;
+//           reading resets them.
 static int const GUIMSG_GET_METERS    = 1;
-static int const GUI_PROTOCOL_VERSION = 2;
+static int const GUI_PROTOCOL_VERSION = 3;
+
+// ── True-peak interpolator (master) ──────────────────────────────────────
+// 4 phases × 12 taps. Phase f interpolates the signal at (m - 6 + f/4) from
+// x[m-11..m] with a Blackman-windowed sinc, normalised to unity DC gain.
+// Phase 0 reproduces x[m-6] exactly, so true peak >= sample peak.
+static int const TP_PHASES = 4;
+static int const TP_TAPS   = 12;
+static int const TP_HIST   = TP_TAPS - 1;     // samples carried between blocks
+static float g_tpCoef[TP_PHASES][TP_TAPS];
+
+static void InitTruePeakFilter()
+{
+    static bool done = false;
+    if (done) return;
+    const double PI_D = 3.14159265358979323846;
+    for (int ph = 0; ph < TP_PHASES; ph++)
+    {
+        double f = (double)ph / TP_PHASES, sum = 0;
+        double c[TP_TAPS];
+        for (int j = 0; j < TP_TAPS; j++)
+        {
+            double d = (TP_TAPS / 2) - j - f;          // distance from the interpolated point (j = age)
+            double sinc = fabs(d) < 1e-12 ? 1.0 : sin(PI_D * d) / (PI_D * d);
+            double w = fabs(d) >= TP_TAPS / 2 ? 0.0
+                     : 0.42 + 0.5 * cos(PI_D * d / (TP_TAPS / 2)) + 0.08 * cos(2 * PI_D * d / (TP_TAPS / 2));
+            c[j] = sinc * w;
+            sum += c[j];
+        }
+        for (int j = 0; j < TP_TAPS; j++)
+            g_tpCoef[ph][j] = (float)(c[j] / sum);
+    }
+    done = true;
+}
+
+// Lock-free "max since last read": audio thread raises, GUI thread exchanges to 0.
+static inline void AtomicMax(std::atomic<float> &a, float v)
+{
+    float cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
 
 // ── Parameter indices (Buzz numbers globals first, then track params) ──────
 enum
@@ -71,8 +155,8 @@ enum
 
 // ── Parameter declarations ─────────────────────────────────────────────────
 static CMachineParameter const paraGain =
-{ pt_word, "Gain", "Master fader in percent (output 0 only). 100 = unity, 200 = +6 dB.",
-  0, 200, 0xFFFF, MPF_STATE, 100 };
+{ pt_word, "Gain", "Master fader in dB (output 0 only). 0 = -inf, 161 = 0 dB, 181 = +10 dB, 0.5 dB steps.",
+  0, LEVEL_MAX, 0xFFFF, MPF_STATE, LEVEL_UNITY };
 
 static CMachineParameter const paraMasterMute =
 { pt_switch, "Master Mute", "Mute the master output (fade time set by Inertia). Direct outs are not affected.",
@@ -91,11 +175,11 @@ static CMachineParameter const paraMute =
   -1, -1, SWITCH_NO, MPF_STATE, SWITCH_OFF };
 
 static CMachineParameter const paraVolume =
-{ pt_byte, "Volume", "Channel fader in percent (master mix and direct out). 100 = unity, 200 = +6 dB.",
-  0, 200, 0xFF, MPF_STATE, 100 };
+{ pt_byte, "Volume", "Channel fader in dB (master mix and direct out). 0 = -inf, 161 = 0 dB, 181 = +10 dB, 0.5 dB steps.",
+  0, LEVEL_MAX, 0xFF, MPF_STATE, LEVEL_UNITY };
 
 static CMachineParameter const paraPan =
-{ pt_byte, "Pan", "Channel balance (master mix and direct out). 0 = left, 64 = centre, 128 = right.",
+{ pt_byte, "Pan", "Balance on stereo channels; constant-power pan (-3 dB centre) on Mono channels. 0 = left, 64 = centre, 128 = right.",
   0, PAN_MAX, 0xFF, MPF_STATE, PAN_CENTRE };
 
 static CMachineParameter const paraMono =
@@ -208,11 +292,11 @@ private:
     std::atomic<int> numChannels;
 
     // Parameter state — written in Tick(), read in MultiWork().
-    int   gainPct = 100;
+    int   gainCode = LEVEL_UNITY;
     bool  solo[MaxChannels]   = {};
     bool  inMute[MaxChannels] = {};
     bool  masterMute = false;
-    int   volumePct[MaxChannels];
+    int   volumeCode[MaxChannels];
     int   panPos[MaxChannels];
     bool  mono[MaxChannels] = {};
 
@@ -227,6 +311,7 @@ private:
 
     // Ramp state (audio thread only).
     float currentInMuteGain[MaxChannels] = {};
+    float currentSoloGain[MaxChannels]   = {};   // solo gate on the master mix, fades with Inertia
     bool  inMuteInitialized = false;
     float currentMuteGain   = 1.0f;
     bool  muteInitialized   = false;
@@ -236,10 +321,15 @@ private:
     // master meters still work.
     float scratch[MAX_BUFFER_LENGTH * 2];
 
-    // Meters — audio thread writes, UI thread reads.
-    std::atomic<float> meterIn[MaxChannels];
-    std::atomic<float> meterL;
-    std::atomic<float> meterR;
+    // Meters — peaks since the last GUI poll (linear, 1.0 = 0 dBFS).
+    // Audio thread raises them (AtomicMax); the GUI read resets them.
+    std::atomic<float> prePeak[MaxChannels];
+    std::atomic<float> postPeak[MaxChannels];
+    std::atomic<float> tpPeakL;
+    std::atomic<float> tpPeakR;
+
+    // True-peak history + working buffer per master side (audio thread only).
+    float tpBuf[2][TP_HIST + MAX_BUFFER_LENGTH];
 };
 
 mi::mi()
@@ -256,16 +346,22 @@ mi::mi()
         tval[i].volume = 0xFF;
         tval[i].pan    = 0xFF;
         tval[i].mono   = SWITCH_NO;
-        volumePct[i] = 100;
+        volumeCode[i] = LEVEL_UNITY;
         panPos[i]    = PAN_CENTRE;
         curL[i] = curR[i] = 1.0f;
         curMono[i] = 0.0f;
-        meterIn[i].store(0.0f, std::memory_order_relaxed);
+        prePeak[i].store(0.0f, std::memory_order_relaxed);
+        postPeak[i].store(0.0f, std::memory_order_relaxed);
     }
-    meterL.store(0.0f, std::memory_order_relaxed);
-    meterR.store(0.0f, std::memory_order_relaxed);
+    tpPeakL.store(0.0f, std::memory_order_relaxed);
+    tpPeakR.store(0.0f, std::memory_order_relaxed);
+    for (int c = 0; c < 2; c++)
+        for (int j = 0; j < TP_HIST; j++)
+            tpBuf[c][j] = 0.0f;
 
     InitChannelNames();
+    InitLevelTable();
+    InitTruePeakFilter();
 }
 
 void mi::Init(CMachineDataInput * const pi)
@@ -313,7 +409,7 @@ void mi::SetNumTracks(int const n)
     {
         solo[i]      = false;
         inMute[i]    = false;
-        volumePct[i] = paraVolume.DefValue;
+        volumeCode[i] = paraVolume.DefValue;
         panPos[i]    = PAN_CENTRE;
         mono[i]      = false;
     }
@@ -344,7 +440,7 @@ void mi::ApplyChannelCount(int want, bool force)
 
 void mi::Tick()
 {
-    if (gval.gain != paraGain.NoValue)       gainPct    = gval.gain;
+    if (gval.gain != paraGain.NoValue)       gainCode   = gval.gain;
     if (gval.masterMute != SWITCH_NO)        masterMute = gval.masterMute != SWITCH_OFF;
     if (gval.inertia != paraInertia.NoValue) inertiaMs  = gval.inertia;
 
@@ -353,7 +449,7 @@ void mi::Tick()
     {
         if (tval[i].solo   != SWITCH_NO)          solo[i]      = tval[i].solo != SWITCH_OFF;
         if (tval[i].mute   != SWITCH_NO)          inMute[i]    = tval[i].mute != SWITCH_OFF;
-        if (tval[i].volume != paraVolume.NoValue) volumePct[i] = tval[i].volume;
+        if (tval[i].volume != paraVolume.NoValue) volumeCode[i] = tval[i].volume;
         if (tval[i].pan    != paraPan.NoValue)    panPos[i]    = tval[i].pan;
         if (tval[i].mono   != SWITCH_NO)          mono[i]      = tval[i].mono != SWITCH_OFF;
     }
@@ -364,15 +460,10 @@ char const *mi::DescribeValue(int const param, int const value)
     switch (param)
     {
     case P_GAIN:
-        if (value <= 0)
-            return "0% (-inf dB)";
-        snprintf(descBuf, sizeof(descBuf), "%d%% (%+.1f dB)", value, 20.0 * log10(value * 0.01));
-        return descBuf;
-
     case P_VOLUME:
         if (value <= 0)
-            return "0% (-inf dB)";
-        snprintf(descBuf, sizeof(descBuf), "%d%% (%+.1f dB)", value, 20.0 * log10(value * 0.01));
+            return "-inf dB";
+        snprintf(descBuf, sizeof(descBuf), "%+.1f dB", LevelDb(value > LEVEL_MAX ? LEVEL_MAX : value));
         return descBuf;
 
     case P_INERTIA:
@@ -430,6 +521,18 @@ static inline void BalanceGains(int pan, float &l, float &r)
     else                   { r = 1.0f; l = (float)(PAN_MAX - pan) / (PAN_MAX - PAN_CENTRE); }
 }
 
+// Constant-power pan law for a mono channel: l² + r² = 1 at every position,
+// so loudness stays even across the pan; -3 dB per side at centre.
+static inline void PanGains(int pan, float &l, float &r)
+{
+    float theta = (float)pan / PAN_MAX * 1.5707963f;   // 0 .. π/2
+    l = cosf(theta);
+    r = sinf(theta);
+    if (pan == PAN_CENTRE) l = r = 0.70710678f;        // exact -3 dB
+    if (pan <= 0)       { l = 1.0f; r = 0.0f; }
+    if (pan >= PAN_MAX) { l = 0.0f; r = 1.0f; }
+}
+
 // One-pole glide. Snaps onto the target once within 1e-4 (-80 dB): closer
 // than that, the per-sample step can fall below float precision near
 // gains of 1-2 and the value would stall a hair short of the target.
@@ -443,7 +546,6 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
 {
     int sr = pMasterInfo->SamplesPerSec;
     if (sr > 0) cachedSr = sr;
-    float decay = cachedSr > 0 ? expf(-2.302585f * n / cachedSr) : 0.95f;
 
     // Smoothing coefficient for Gain / Volume / Pan.
     float k = cachedSr > 0 ? 1.0f - expf(-1.0f / (SMOOTH_SECONDS * cachedSr)) : 1.0f;
@@ -457,18 +559,25 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
     float tgtL[MaxChannels], tgtR[MaxChannels];
     for (int i = 0; i < MaxChannels; i++)
     {
-        float v = volumePct[i] * 0.01f, bl, br;
-        BalanceGains(panPos[i], bl, br);
+        float v = LevelGain(volumeCode[i]), bl, br;
+        if (mono[i]) PanGains(panPos[i], bl, br);
+        else         BalanceGains(panPos[i], bl, br);
         tgtL[i] = v * bl;
         tgtR[i] = v * br;
     }
-    float tgtGain = gainPct * 0.01f;
+    float tgtGain = LevelGain(gainCode);
 
     // First block after creation/load: start AT the targets (no fade-in).
     if (!inMuteInitialized)
     {
+        bool anySoloInit = false;
+        for (int i = 0; i < channels; i++)
+            if (solo[i]) anySoloInit = true;
         for (int i = 0; i < MaxChannels; i++)
+        {
             currentInMuteGain[i] = inMute[i] ? 0.0f : 1.0f;
+            currentSoloGain[i]   = (anySoloInit && !solo[i]) ? 0.0f : 1.0f;
+        }
         inMuteInitialized = true;
     }
     if (!levelsInitialized)
@@ -500,8 +609,8 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         if (in == nullptr)
         {
             // Nothing to process: park every ramp at its target.
-            meterIn[i].store(meterIn[i].load(std::memory_order_relaxed) * decay, std::memory_order_relaxed);
             currentInMuteGain[i] = inMute[i] ? 0.0f : 1.0f;
+            currentSoloGain[i]   = (anySolo && !solo[i]) ? 0.0f : 1.0f;
             curL[i] = tgtL[i];
             curR[i] = tgtR[i];
             curMono[i] = mono[i] ? 1.0f : 0.0f;
@@ -510,8 +619,9 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
             continue;
         }
 
-        float p = 0.0f;
-        float effSoloGain = (anySolo && !solo[i]) ? 0.0f : 1.0f;
+        float p = 0.0f, pp = 0.0f;   // pre- and post-fader peaks
+        float soloTarget = (anySolo && !solo[i]) ? 0.0f : 1.0f;
+        float soloGain   = currentSoloGain[i];
         float inTarget    = inMute[i] ? 0.0f : 1.0f;
         float inGain      = currentInMuteGain[i];
         float cl = curL[i], cr = curR[i];
@@ -526,6 +636,9 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
             if (inGain < inTarget)      inGain = fminf2(inGain + muteStep, inTarget);
             else if (inGain > inTarget) inGain = fmaxf2(inGain - muteStep, inTarget);
 
+            if (soloGain < soloTarget)      soloGain = fminf2(soloGain + muteStep, soloTarget);
+            else if (soloGain > soloTarget) soloGain = fmaxf2(soloGain - muteStep, soloTarget);
+
             cl = Glide(cl, tl, k);
             cr = Glide(cr, tr, k);
             cm = Glide(cm, tm, k);
@@ -538,8 +651,8 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
             float sr  = mr * inGain * cr;
 
             // Master mix adds the solo gate (Gain applied below).
-            master[2 * s]     += sl * effSoloGain;
-            master[2 * s + 1] += sr * effSoloGain;
+            master[2 * s]     += sl * soloGain;
+            master[2 * s + 1] += sr * soloGain;
 
             // Direct out: the channel strip as-is (post-fader, post-pan).
             if (dir != nullptr)
@@ -550,12 +663,15 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
 
             float a = fmaxf2(fabsf(l), fabsf(r));
             if (a > p) p = a;
+            float b = fmaxf2(fabsf(sl), fabsf(sr));
+            if (b > pp) pp = b;
         }
 
         currentInMuteGain[i] = inGain;
+        currentSoloGain[i]   = soloGain;
         curL[i] = cl; curR[i] = cr; curMono[i] = cm;
-        meterIn[i].store(fmaxf2(p / FULL_SCALE, meterIn[i].load(std::memory_order_relaxed) * decay),
-                         std::memory_order_relaxed);
+        AtomicMax(prePeak[i],  p  / FULL_SCALE);
+        AtomicMax(postPeak[i], pp / FULL_SCALE);
     }
 
     // Channels above the current count: park ramps at target and clear meters,
@@ -563,10 +679,12 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
     for (int i = channels; i < MaxChannels; i++)
     {
         currentInMuteGain[i] = inMute[i] ? 0.0f : 1.0f;
+        currentSoloGain[i]   = (anySolo && !solo[i]) ? 0.0f : 1.0f;
         curL[i] = tgtL[i];
         curR[i] = tgtR[i];
         curMono[i] = mono[i] ? 1.0f : 0.0f;
-        meterIn[i].store(0.0f, std::memory_order_relaxed);
+        prePeak[i].store(0.0f, std::memory_order_relaxed);
+        postPeak[i].store(0.0f, std::memory_order_relaxed);
     }
 
     // Master: Gain (smoothed) × Master Mute ramp, collect peaks.
@@ -578,7 +696,8 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
     }
 
     float g = curGain;
-    float peakL = 0.0f, peakR = 0.0f;
+    float *tl = tpBuf[0] + TP_HIST;     // this block's master samples, after the history
+    float *tr = tpBuf[1] + TP_HIST;
     for (int s = 0; s < n; s++)
     {
         if (currentMuteGain < targetMuteGain)
@@ -593,15 +712,34 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         float r = master[2 * s + 1] * effG;
         master[2 * s]     = l;
         master[2 * s + 1] = r;
-
-        float al = fabsf(l), ar = fabsf(r);
-        if (al > peakL) peakL = al;
-        if (ar > peakR) peakR = ar;
+        tl[s] = l;
+        tr[s] = r;
     }
     curGain = g;
 
-    meterL.store(fmaxf2(peakL / FULL_SCALE, meterL.load(std::memory_order_relaxed) * decay), std::memory_order_relaxed);
-    meterR.store(fmaxf2(peakR / FULL_SCALE, meterR.load(std::memory_order_relaxed) * decay), std::memory_order_relaxed);
+    // True peak: 4x oversampled peak of each master side.
+    for (int c = 0; c < 2; c++)
+    {
+        float *x = tpBuf[c];
+        float peak = 0.0f;
+        for (int m = TP_HIST; m < TP_HIST + n; m++)
+        {
+            float const *win = x + m - TP_HIST;           // x[m-11 .. m]
+            for (int ph = 0; ph < TP_PHASES; ph++)
+            {
+                float const *h = g_tpCoef[ph];
+                float y = 0.0f;
+                for (int j = 0; j < TP_TAPS; j++)
+                    y += h[j] * win[TP_HIST - j];         // j = age of the sample
+                float a = fabsf(y);
+                if (a > peak) peak = a;
+            }
+        }
+        // Carry the last TP_HIST samples into the next block.
+        for (int j = 0; j < TP_HIST; j++)
+            x[j] = x[n + j];
+        AtomicMax(c == 0 ? tpPeakL : tpPeakR, peak / FULL_SCALE);
+    }
 }
 
 char const *mi::GetChannelName(bool input, int index)
@@ -625,9 +763,12 @@ bool mi::HandleGUIMessage(CMachineDataOutput *pout, CMachineDataInput *pin)
         pout->Write(GUI_PROTOCOL_VERSION);
         pout->Write(channels);
         for (int i = 0; i < channels; i++)
-            pout->Write(meterIn[i].load(std::memory_order_relaxed));
-        pout->Write(meterL.load(std::memory_order_relaxed));
-        pout->Write(meterR.load(std::memory_order_relaxed));
+        {
+            pout->Write(prePeak[i].exchange(0.0f, std::memory_order_relaxed));
+            pout->Write(postPeak[i].exchange(0.0f, std::memory_order_relaxed));
+        }
+        pout->Write(tpPeakL.exchange(0.0f, std::memory_order_relaxed));
+        pout->Write(tpPeakR.exchange(0.0f, std::memory_order_relaxed));
         return true;
     }
 

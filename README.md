@@ -19,8 +19,15 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
   (balance) control and a **Mono** switch, in the GUI and as track parameters you can
   sequence.
 - **Mono** sums a channel to (L+R)/2 before its fader and pan, so a source with the same
-  signal on both sides keeps its level. With Mono on, Pan works as a normal panner.
-  Switching crossfades over about 10 ms, so it doesn't click.
+  signal on both sides keeps its level. Switching crossfades over about 10 ms, so it
+  doesn't click.
+- **Decibel faders.** Volume and Gain run from −∞ and −80 dB up to +10 dB in 0.5 dB steps,
+  with 0 dB as the default. The GUI faders use a console-style taper: 0 dB sits at 75 %
+  of travel, −20 dB at 42 % and −40 dB at 20 %.
+- **Pan laws.** Stereo channels use a balance law (centre = both sides at unity). Mono
+  channels use a constant-power pan law (−3 dB per side at centre), so a mono source
+  keeps the same loudness wherever it's panned. Turning MO on for a centred channel
+  therefore lowers each side by 3 dB, which is the standard pan-law trade-off.
 - **Numbering is 0-based**, matching Buzz's plug menus and track numbers. Track *k*,
   GUI row *k* and input plug **In *k*** are the same channel.
 - **Multi-out.** Output plug **0 is the master mix**. The direct outs follow it, so the
@@ -33,16 +40,27 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
     strip as-is. Solo, Gain and Master Mute act on the master mix only.
 - **Smooth level changes.** Gain, Volume and Pan glide to new values (about 10 ms), so
   automation and fader moves don't click or zipper. Mutes keep their Inertia fade.
-- **Inertia** 0 … 500 ms (default 25). The fade time shared by every mute.
-- **Metering:** input meters (before fader and mute), plus master L/R, with held-peak
-  lines and dB readouts.
+- **Inertia** 0 … 500 ms (default 25). The fade time shared by every mute and solo.
+- **Metering:**
+  - **Channel meters** switch between **PRE** (raw input) and **POST** (after Mono, Mute,
+    Volume and Pan) with the PRE/POST button in the IN header.
+  - **Master meters** show **true peak**: 4× oversampled, so peaks between samples are
+    caught. On a test tone whose samples all land at −3 dB of the real peak, a plain
+    sample meter reads 3 dB low; this reads within 0.01 dB.
+  - **Exact peaks:** the machine reports the highest peak since the GUI's last check, so
+    no short peak is missed.
+  - **Ballistics:** instant rise, falls about 12 dB/s (20 dB in 1.7 s, IEC 60268-18
+    style), 3 s peak hold with a dB readout.
+  - **Clip lights** latch red at 0 dBFS or above, on the bar end and the readout. Click
+    any meter to clear all clip lights and peak holds.
 
 ### GUI controls
 
 - **M / S:** mute and solo per channel. **M** on the OUT row is the Master Mute.
 - **MO:** Mono toggle per channel (teal when on).
-- **VOL / PAN faders:** drag to set, double-click to reset (unity or centre), mouse
-  wheel for ±5 (±1 with Ctrl). The tooltip shows the value in dB or L/C/R.
+- **VOL / PAN faders:** drag to set, double-click to reset (0 dB or centre). The mouse
+  wheel moves VOL by 1 dB (0.5 dB with Ctrl) and PAN by 5 steps (1 with Ctrl). The
+  tooltip shows the value in dB or L/C/R.
 - **Master fader:** on the OUT row, controls Gain.
 - **− / +:** remove or add a channel (track).
 
@@ -50,14 +68,17 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
 
 | Group | Parameter | Notes |
 |---|---|---|
-| Global | Gain | master fader, 0–200 %, output 0 only |
+| Global | Gain | master fader in dB (see below), output 0 only |
 | Global | Master Mute | master mix only |
 | Global | Inertia | 0–500 ms |
 | Track *k* | Solo | channel *k*, master mix |
 | Track *k* | Mute | channel *k*, master mix and Direct In *k* |
-| Track *k* | Volume | channel fader, 0–200 % (100 = unity), master mix and Direct In *k* |
-| Track *k* | Pan | balance, 0 = left, 64 = centre, 128 = right, master mix and Direct In *k* |
+| Track *k* | Volume | channel fader in dB (see below), master mix and Direct In *k* |
+| Track *k* | Pan | 0 = left, 64 = centre, 128 = right; balance (stereo) or constant-power (Mono) |
 | Track *k* | Mono | sum to (L+R)/2 before fader and pan, master mix and Direct In *k* |
+
+**Fader values** (Gain and Volume): 0 = −∞, 1 = −80 dB, then 0.5 dB per step, so 149 = −6 dB,
+161 = 0 dB (the default) and 181 = +10 dB. The parameter window and GUI tooltips show dB.
 
 New track parameters are always added at the end (Volume and Pan in v1.3, Mono in
 v1.3.1), so existing ones keep their positions and older songs load with the new
@@ -134,7 +155,10 @@ working.
 reaches `HandleGUIMessage` on the C++ side.
 
 - Request: `int32 id` (1 = get meters).
-- Reply (protocol v2): `int32 version (2)`, `int32 channel count N`, then N input meter floats, then master L and R floats.
+- Reply (protocol v3): `int32 version (3)`, `int32 channel count N`, then N pairs of
+  pre-fader and post-fader peak floats, then master true-peak L and R floats.
+- Every value is the highest peak since the previous request, and reading resets it.
+  The GUI drops the first reply after the window opens, since it may hold old peaks.
 - The GUI rebuilds its rows whenever N changes.
 - Meter values are normalised so that 1.0 = 0 dBFS.
 
@@ -146,24 +170,22 @@ Button states are read from the parameters themselves, and clicks go through
 load a .NET 10 assembly. The source avoids `Math.Clamp` and `MathF`, which
 .NET Framework lacks.
 
-## Verify in Buzz 1503 (v1.3.2)
+## Verify in Buzz 1503 (v1.5.0)
 
 Not yet checked on a live install:
 
-1. **GUI faders.** Each row shows a VOL and a PAN fader, and the OUT row has the master
-   fader. Dragging, double-click reset and the mouse wheel all work. The faders move when
-   the parameter window or pattern playback changes the values.
-2. **No clicks.** Sweeping or automating Volume, Pan and Gain sounds smooth.
-3. **Routing.** Gain affects only output 0. A direct out follows its channel's Mono,
-   Volume, Pan and Mute.
-4. **Labels.** Right-clicking an input plug shows `0. In 0`, `1. In 1`… and an output
-   plug shows `0. Master`, `1. Direct In 0`… The GUI rows are numbered from 0.
-5. **Mono.** MO sums a stereo source to the centre without clicking. With MO on, Pan
-   moves the source fully left or right.
-6. **Songs saved with v1.2.** They should load with every channel at Volume 100 and Pan
-   centre, so they sound as before. The one exception is direct outs in songs that used a
-   Gain other than 100 %: they will now be louder or quieter, because Gain no longer
-   scales them.
+1. **dB faders.** VOL and the master fader read in dB. Double-click gives 0 dB at about
+   three-quarters of the fader. The mouse wheel moves 1 dB (0.5 dB with Ctrl).
+2. **Solo fades.** Soloing or unsoloing on sustained material fades over the Inertia time
+   instead of clicking.
+3. **Mono pan.** With MO on, panning from left through centre to right keeps an even
+   loudness, and centre is 3 dB down per side.
+4. **Meters.**
+   - PRE/POST switches the channel meters: POST follows the faders and mutes.
+   - The master shows true peak.
+   - Meters fall smoothly, the hold line stays about 3 s, and clip lights latch at
+     0 dBFS until you click a meter.
+5. **Labels.** Input plugs read `0. In 0`… and outputs `0. Master`, `1. Direct In 0`…
 
 ## Verified in Buzz 1503 (v1.2)
 
