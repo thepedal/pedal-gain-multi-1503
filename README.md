@@ -170,22 +170,18 @@ Button states are read from the parameters themselves, and clicks go through
 load a .NET 10 assembly. The source avoids `Math.Clamp` and `MathF`, which
 .NET Framework lacks.
 
-## Verify in Buzz 1503 (v1.5.0)
+## Verified in Buzz 1503 (v1.5.0)
 
-Not yet checked on a live install:
+Confirmed on a live Buzz 1503 (32-bit) install:
 
-1. **dB faders.** VOL and the master fader read in dB. Double-click gives 0 dB at about
-   three-quarters of the fader. The mouse wheel moves 1 dB (0.5 dB with Ctrl).
-2. **Solo fades.** Soloing or unsoloing on sustained material fades over the Inertia time
-   instead of clicking.
-3. **Mono pan.** With MO on, panning from left through centre to right keeps an even
-   loudness, and centre is 3 dB down per side.
-4. **Meters.**
-   - PRE/POST switches the channel meters: POST follows the faders and mutes.
-   - The master shows true peak.
-   - Meters fall smoothly, the hold line stays about 3 s, and clip lights latch at
-     0 dBFS until you click a meter.
-5. **Labels.** Input plugs read `0. In 0`… and outputs `0. Master`, `1. Direct In 0`…
+- **dB faders:** VOL and the master fader read in dB. Double-click resets to 0 dB at about
+  three-quarters of the fader. The mouse wheel moves 1 dB (0.5 dB with Ctrl).
+- **Solo fades:** soloing and unsoloing fade over the Inertia time, with no click.
+- **Mono pan:** with MO on, panning keeps an even loudness, with centre 3 dB down per side.
+- **Meters:** PRE/POST switches the channel meters, and the master shows true peak.
+  Meters fall smoothly, the hold line stays about 3 s, and clip lights latch at 0 dBFS
+  until a meter is clicked.
+- **Labels:** input plugs read `0. In 0`…, outputs `0. Master`, `1. Direct In 0`…
 
 ## Verified in Buzz 1503 (v1.2)
 
