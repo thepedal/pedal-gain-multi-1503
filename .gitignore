@@ -480,3 +480,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# MachineInterface.h is fetched at build time, not redistributed
+native/sdk/
