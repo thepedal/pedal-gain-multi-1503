@@ -15,24 +15,53 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
 
   The input and output plugs follow the track count. Only existing channels appear in
   the parameter window.
-- **Multi-out.** Output plug **0 is the master mix**. Output plug **k is the direct out
-  of input k** (plug 1 carries input 1, plug 2 carries input 2, and so on).
-  - **Master (out 0):** every input with its Mute and Solo applied, then × Gain, then × Master Mute.
-  - **Direct k (out k):** input k × its Mute (same Inertia fade) × Gain. Solo and Master Mute
-    act on the master mix only.
-- **Gain** 0 … 200 % (100 = unity, 200 = +6 dB). Applies to the master and every direct out.
+- **Channel strips.** Each channel has Mute, Solo, a **Volume** fader, a **Pan**
+  (balance) control and a **Mono** switch, in the GUI and as track parameters you can
+  sequence.
+- **Mono** sums a channel to (L+R)/2 before its fader and pan, so a source with the same
+  signal on both sides keeps its level. With Mono on, Pan works as a normal panner.
+  Switching crossfades over about 10 ms, so it doesn't click.
+- **Numbering is 0-based**, matching Buzz's plug menus and track numbers. Track *k*,
+  GUI row *k* and input plug **In *k*** are the same channel.
+- **Multi-out.** Output plug **0 is the master mix**. The direct outs follow it, so the
+  direct out of In *k* is output plug *k*+1, labelled **Direct In *k***. For example,
+  plug 1 carries In 0 and plug 2 carries In 1. The master stays at plug 0 so its cable
+  never moves when channels are added or deleted.
+  - **Master (out 0):** Σ input → Mono → × Mute × Solo × Volume × Pan, then × **Gain**
+    (the master fader), then × Master Mute.
+  - **Direct In k (out k+1):** In k → Mono → × its Mute × Volume × Pan, i.e. the channel
+    strip as-is. Solo, Gain and Master Mute act on the master mix only.
+- **Smooth level changes.** Gain, Volume and Pan glide to new values (about 10 ms), so
+  automation and fader moves don't click or zipper. Mutes keep their Inertia fade.
 - **Inertia** 0 … 500 ms (default 25). The fade time shared by every mute.
-- **Metering:** input meters (before mute/solo), plus master L/R, with held-peak lines and dB readouts.
+- **Metering:** input meters (before fader and mute), plus master L/R, with held-peak
+  lines and dB readouts.
+
+### GUI controls
+
+- **M / S:** mute and solo per channel. **M** on the OUT row is the Master Mute.
+- **MO:** Mono toggle per channel (teal when on).
+- **VOL / PAN faders:** drag to set, double-click to reset (unity or centre), mouse
+  wheel for ±5 (±1 with Ctrl). The tooltip shows the value in dB or L/C/R.
+- **Master fader:** on the OUT row, controls Gain.
+- **− / +:** remove or add a channel (track).
 
 ### Parameters
 
 | Group | Parameter | Notes |
 |---|---|---|
-| Global | Gain | 0–200 % |
+| Global | Gain | master fader, 0–200 %, output 0 only |
 | Global | Master Mute | master mix only |
 | Global | Inertia | 0–500 ms |
 | Track *k* | Solo | channel *k*, master mix |
-| Track *k* | Mute | channel *k*, master mix and direct out *k* |
+| Track *k* | Mute | channel *k*, master mix and Direct In *k* |
+| Track *k* | Volume | channel fader, 0–200 % (100 = unity), master mix and Direct In *k* |
+| Track *k* | Pan | balance, 0 = left, 64 = centre, 128 = right, master mix and Direct In *k* |
+| Track *k* | Mono | sum to (L+R)/2 before fader and pan, master mix and Direct In *k* |
+
+New track parameters are always added at the end (Volume and Pan in v1.3, Mono in
+v1.3.1), so existing ones keep their positions and older songs load with the new
+controls at their defaults.
 
 ## Layout
 
@@ -117,6 +146,25 @@ Button states are read from the parameters themselves, and clicks go through
 load a .NET 10 assembly. The source avoids `Math.Clamp` and `MathF`, which
 .NET Framework lacks.
 
+## Verify in Buzz 1503 (v1.3.2)
+
+Not yet checked on a live install:
+
+1. **GUI faders.** Each row shows a VOL and a PAN fader, and the OUT row has the master
+   fader. Dragging, double-click reset and the mouse wheel all work. The faders move when
+   the parameter window or pattern playback changes the values.
+2. **No clicks.** Sweeping or automating Volume, Pan and Gain sounds smooth.
+3. **Routing.** Gain affects only output 0. A direct out follows its channel's Mono,
+   Volume, Pan and Mute.
+4. **Labels.** Right-clicking an input plug shows `0. In 0`, `1. In 1`… and an output
+   plug shows `0. Master`, `1. Direct In 0`… The GUI rows are numbered from 0.
+5. **Mono.** MO sums a stereo source to the centre without clicking. With MO on, Pan
+   moves the source fully left or right.
+6. **Songs saved with v1.2.** They should load with every channel at Volume 100 and Pan
+   centre, so they sound as before. The one exception is direct outs in songs that used a
+   Gain other than 100 %: they will now be louder or quieter, because Gain no longer
+   scales them.
+
 ## Verified in Buzz 1503 (v1.2)
 
 Confirmed on a live Buzz 1503 (32-bit) install:
@@ -128,6 +176,7 @@ Confirmed on a live Buzz 1503 (32-bit) install:
 - **Deleting a track with a cable attached:** Buzz removes the cable along with the channel.
 - **Save and reload:** a song reloads with its saved track count and Solo/Mute states.
 - **Direct outs:** each follows its input's Mute, with the Inertia fade.
+  (In v1.3 they also follow the channel's Volume fader, and no longer follow Gain.)
 - **GUI:** the meters and the M/S buttons work.
 
 **Songs saved with v1.0 or v1.1 are not compatible.** The parameter layout changed, so

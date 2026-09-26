@@ -16,6 +16,10 @@
 //   • v1.2: channels are TRACKS (1..24). Solo/Mute are track parameters
 //     (value per track); rows follow the track count reported in every
 //     meter reply (protocol v2). [−]/[+] in the IN header remove/add a track.
+//   • v1.3: per-row Volume fader and Pan (balance) control, master Gain
+//     fader on the OUT row. All bound to parameters; the machine smooths
+//     every level change.
+//   • v1.3.1: per-row MO (Mono) toggle.
 //
 // Renders a compact meter stack at the top of the parameters window:
 //
@@ -81,7 +85,12 @@ namespace WDE.PedalGainMultiN
         // Solo/Mute are TRACK parameters: one IParameter, value per track
         // (track k = channel k). Master Mute is a global parameter.
         IParameterGroup trackGroup;
-        IParameter soloParam, muteParam, masterMuteParam;
+        IParameter soloParam, muteParam, volumeParam, panParam, monoParam, masterMuteParam, gainParam;
+
+        // Per-row faders (rebuilt with the rows) + the master fader.
+        readonly MiniFader[] volFaders = new MiniFader[MaxChannels];
+        readonly MiniFader[] panFaders = new MiniFader[MaxChannels];
+        MiniFader masterFader;
 
         // Latest meter snapshot from the native side (1.0 == 0 dBFS).
         readonly float[] meterIn = new float[MaxChannels];
@@ -105,6 +114,8 @@ namespace WDE.PedalGainMultiN
         readonly TextBlock[] inMuteLabels  = new TextBlock[MaxChannels];
         readonly Border[]    soloButtons   = new Border[MaxChannels];
         readonly TextBlock[] soloLabels    = new TextBlock[MaxChannels];
+        readonly Border[]    monoButtons   = new Border[MaxChannels];
+        readonly TextBlock[] monoLabels    = new TextBlock[MaxChannels];
         readonly Rectangle[] inBars        = new Rectangle[MaxChannels];
         readonly Rectangle[] inPeakLines   = new Rectangle[MaxChannels];
         readonly TextBlock[] inDbTexts     = new TextBlock[MaxChannels];
@@ -128,6 +139,9 @@ namespace WDE.PedalGainMultiN
         const float LABEL_W   = 18f;   // room for two-digit channel numbers
         const float W         = 200f;
         const float READOUT_W = 46f;
+        const float FADER_W   = 70f;   // channel Volume / master Gain fader column
+        const float PAN_W     = 38f;   // channel Pan column
+        const float MONO_W    = 26f;   // channel Mono toggle column
         const float H         = 9f;
         const float DB_MIN    = -60f;
         const int   HOLD_FRAMES = 90;   // ~3 s at 33 ms/frame
@@ -153,7 +167,14 @@ namespace WDE.PedalGainMultiN
         static readonly Brush MuteOnBg    = Freeze(new SolidColorBrush(Color.FromRgb(215,  55,  45)));
         static readonly Brush MuteOnFg    = Freeze(new SolidColorBrush(Color.FromRgb(245, 245, 245)));
 
+        // Mono — teal when on, so it can't be confused with mute (red) or solo (amber).
+        static readonly Brush MonoOnBg    = Freeze(new SolidColorBrush(Color.FromRgb( 40, 160, 160)));
+        static readonly Brush MonoOnFg    = Freeze(new SolidColorBrush(Color.FromRgb( 20,  20,  25)));
+
         static readonly FontFamily Mono = new FontFamily("Consolas");
+
+        // Fader fill — cool blue so it doesn't read as a level meter.
+        static readonly Brush FaderBrush = Freeze(new SolidColorBrush(Color.FromRgb(70, 130, 200)));
 
         static Brush Freeze(Brush b) { b.Freeze(); return b; }
 
@@ -203,6 +224,9 @@ namespace WDE.PedalGainMultiN
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(LABEL_W)   });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(W)         });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(READOUT_W) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(FADER_W)   });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(PAN_W)     });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(MONO_W)    });
             return g;
         }
 
@@ -225,7 +249,7 @@ namespace WDE.PedalGainMultiN
             {
                 Height              = 1,
                 Fill                = SeparatorBrush,
-                Margin              = new Thickness(MUTE_W + SOLO_W + LABEL_W, 5, READOUT_W, 3),
+                Margin              = new Thickness(MUTE_W + SOLO_W + LABEL_W, 5, READOUT_W + FADER_W + PAN_W + MONO_W, 3),
                 HorizontalAlignment = HorizontalAlignment.Stretch
             });
 
@@ -240,7 +264,7 @@ namespace WDE.PedalGainMultiN
             root.Children.Add(MakeScaleRow());
 
             Content  = root;
-            MinWidth = MUTE_W + SOLO_W + LABEL_W + W + READOUT_W + 12;
+            MinWidth = MUTE_W + SOLO_W + LABEL_W + W + READOUT_W + FADER_W + PAN_W + MONO_W + 12;
         }
 
         StackPanel inRowsPanel;
@@ -262,7 +286,7 @@ namespace WDE.PedalGainMultiN
                 int track = i;
                 var (mbtn, mlbl) = MakeToggleButton(
                     letter:    "M",
-                    tooltip:   $"Mute input {i + 1} on the master mix and its direct out (fade time = Inertia)",
+                    tooltip:   $"Mute In {i} on the master mix and its direct out (fade time = Inertia)",
                     onClick:   () => ToggleTrackParameter(muteParam, track),
                     onBg:      MuteOnBg,
                     onFg:      MuteOnFg);
@@ -274,7 +298,7 @@ namespace WDE.PedalGainMultiN
                 // Col 1 — solo button.
                 var (sbtn, slbl) = MakeToggleButton(
                     letter:    "S",
-                    tooltip:   $"Solo input {i + 1} on the master mix",
+                    tooltip:   $"Solo In {i} on the master mix",
                     onClick:   () => ToggleTrackParameter(soloParam, track),
                     onBg:      SoloOnBg,
                     onFg:      SoloOnFg);
@@ -284,8 +308,9 @@ namespace WDE.PedalGainMultiN
                 soloLabels[i]  = slbl;
 
                 // Col 2 — input number label.
-                var num = RowLabel((i + 1).ToString(), col: 2);
-                num.ToolTip = $"Input {i + 1} — its direct out (× Gain) is output plug {i + 1}; plug 0 is the master mix";
+                // 0-based: row i = track i = input plug In i (as Buzz numbers them).
+                var num = RowLabel(i.ToString(), col: 2);
+                num.ToolTip = $"In {i} (track {i}) — its direct out is output plug {i + 1} (Direct In {i}); plug 0 is the master mix";
                 grid.Children.Add(num);
 
                 // Col 3 — bar canvas + peak-hold line.
@@ -303,6 +328,33 @@ namespace WDE.PedalGainMultiN
 
                 inHoldDb[i]     = DB_MIN;
                 inHoldFrames[i] = 0;
+
+                // Col 5 — channel fader (Volume), col 6 — balance (Pan).
+                var vol = new MiniFader(FADER_W - 8, H, bipolar: false, fill: FaderBrush,
+                                        param: () => volumeParam, track: track);
+                Grid.SetColumn(vol.Root, 5);
+                grid.Children.Add(vol.Root);
+                volFaders[i] = vol;
+
+                var pan = new MiniFader(PAN_W - 8, H, bipolar: true, fill: FaderBrush,
+                                        param: () => panParam, track: track);
+                Grid.SetColumn(pan.Root, 6);
+                grid.Children.Add(pan.Root);
+                panFaders[i] = pan;
+
+                // Col 7 — Mono toggle.
+                var (obtn, olbl) = MakeToggleButton(
+                    letter:  "MO",
+                    tooltip: $"Mono: sum In {i} to (L+R)/2 before its fader and pan",
+                    onClick: () => ToggleTrackParameter(monoParam, track),
+                    onBg:    MonoOnBg,
+                    onFg:    MonoOnFg,
+                    width:   MONO_W - 6);
+                obtn.Margin = new Thickness(6, 0, 0, 0);
+                Grid.SetColumn(obtn, 7);
+                grid.Children.Add(obtn);
+                monoButtons[i] = obtn;
+                monoLabels[i]  = olbl;
 
                 inRowsPanel.Children.Add(grid);
             }
@@ -330,6 +382,21 @@ namespace WDE.PedalGainMultiN
             buttons.Children.Add(MakeActionButton("+", "Add a channel (track), up to 24",  () => ChangeChannelCount(+1)));
             Grid.SetColumn(buttons, 3);
             grid.Children.Add(buttons);
+
+            var volHdr = SectionHeader("VOL");
+            ((FrameworkElement)volHdr).Margin = new Thickness(6, 1, 0, 1);
+            Grid.SetColumn(volHdr, 5);
+            grid.Children.Add(volHdr);
+
+            var panHdr = SectionHeader("PAN");
+            ((FrameworkElement)panHdr).Margin = new Thickness(6, 1, 0, 1);
+            Grid.SetColumn(panHdr, 6);
+            grid.Children.Add(panHdr);
+
+            var monoHdr = SectionHeader("MONO");
+            ((FrameworkElement)monoHdr).Margin = new Thickness(4, 1, 0, 1);
+            Grid.SetColumn(monoHdr, 7);
+            grid.Children.Add(monoHdr);
 
             return grid;
         }
@@ -405,6 +472,12 @@ namespace WDE.PedalGainMultiN
             };
             Grid.SetColumn(hdr, 2);
             grid.Children.Add(hdr);
+
+            // Col 5 — master fader (Gain, output 0 only).
+            masterFader = new MiniFader(FADER_W - 8, H, bipolar: false, fill: FaderBrush,
+                                        param: () => gainParam, track: 0);
+            Grid.SetColumn(masterFader.Root, 5);
+            grid.Children.Add(masterFader.Root);
 
             return grid;
         }
@@ -522,7 +595,8 @@ namespace WDE.PedalGainMultiN
         // ── Toggle buttons (used by both solo and mute) ──────────────────────
 
         (Border border, TextBlock label)
-            MakeToggleButton(string letter, string tooltip, Action onClick, Brush onBg, Brush onFg)
+            MakeToggleButton(string letter, string tooltip, Action onClick, Brush onBg, Brush onFg,
+                             double width = SOLO_W - 2)
         {
             var text = new TextBlock
             {
@@ -540,7 +614,7 @@ namespace WDE.PedalGainMultiN
                 // MUTE_W == SOLO_W, so the same button width works in both
                 // columns. Two-pixel padding keeps the buttons visually
                 // separated when they sit side-by-side in an input row.
-                Width               = SOLO_W - 2,
+                Width               = width,
                 Height              = H,
                 Background          = SoloOffBg,
                 BorderBrush         = SoloBorder,
@@ -563,6 +637,141 @@ namespace WDE.PedalGainMultiN
             };
 
             return (btn, text);
+        }
+
+        // ── MiniFader — compact horizontal fader bound to one parameter/track ──
+        //
+        //   drag            set value (the parameter is the source of truth)
+        //   double-click    reset to the parameter's default (unity / centre)
+        //   mouse wheel     ±5 steps, ±1 with Ctrl
+        //   tooltip         the machine's own DescribeValue text (dB, L/C/R)
+        //
+        // Bipolar faders (Pan) fill from the centre towards the value.
+        sealed class MiniFader
+        {
+            public readonly Canvas Root;
+
+            readonly Func<IParameter> param;
+            readonly int       track;
+            readonly bool      bipolar;
+            readonly double    width;
+            readonly Rectangle fill;
+            readonly Rectangle defaultTick;
+            int shownValue = int.MinValue;
+
+            public MiniFader(double width, double height, bool bipolar, Brush fill,
+                             Func<IParameter> param, int track)
+            {
+                this.width   = width;
+                this.bipolar = bipolar;
+                this.param   = param;
+                this.track   = track;
+
+                Root = new Canvas
+                {
+                    Width               = width,
+                    Height              = height,
+                    Margin              = new Thickness(6, 0, 0, 0),
+                    HorizontalAlignment = HorizontalAlignment.Left,
+                    VerticalAlignment   = VerticalAlignment.Center,
+                    Background          = TrackBrush,
+                    ClipToBounds        = true,
+                    Cursor              = Cursors.Hand
+                };
+
+                this.fill = new Rectangle { Height = height, Width = 0, Fill = fill };
+                Root.Children.Add(this.fill);
+
+                // Marks the default (unity for Volume/Gain, centre for Pan).
+                defaultTick = new Rectangle { Width = 1, Height = height, Fill = ScaleColor };
+                Root.Children.Add(defaultTick);
+
+                Root.MouseLeftButtonDown += (_, e) =>
+                {
+                    var p = param();
+                    if (p == null) return;
+                    if (e.ClickCount == 2)
+                        Set(p.DefValue);
+                    else
+                    {
+                        Root.CaptureMouse();
+                        SetFromX(e.GetPosition(Root).X);
+                    }
+                    e.Handled = true;
+                };
+                Root.MouseMove += (_, e) =>
+                {
+                    if (Root.IsMouseCaptured)
+                        SetFromX(e.GetPosition(Root).X);
+                };
+                Root.MouseLeftButtonUp += (_, e) =>
+                {
+                    if (Root.IsMouseCaptured)
+                        Root.ReleaseMouseCapture();
+                };
+                Root.MouseWheel += (_, e) =>
+                {
+                    var p = param();
+                    if (p == null) return;
+                    int step = (Keyboard.Modifiers & ModifierKeys.Control) != 0 ? 1 : 5;
+                    Set(p.GetValue(track) + (e.Delta > 0 ? step : -step));
+                    e.Handled = true;
+                };
+            }
+
+            void SetFromX(double x)
+            {
+                var p = param();
+                if (p == null) return;
+                double frac = x / width;
+                if (frac < 0) frac = 0;
+                if (frac > 1) frac = 1;
+                Set(p.MinValue + (int)Math.Round(frac * (p.MaxValue - p.MinValue)));
+            }
+
+            void Set(int v)
+            {
+                var p = param();
+                if (p == null) return;
+                if (v < p.MinValue) v = p.MinValue;
+                if (v > p.MaxValue) v = p.MaxValue;
+                if (v != p.GetValue(track))
+                    p.SetValue(track, v);
+                Refresh();
+            }
+
+            double XOf(IParameter p, int v) =>
+                p.MaxValue > p.MinValue ? (double)(v - p.MinValue) / (p.MaxValue - p.MinValue) * width : 0;
+
+            public void Refresh()
+            {
+                var p = param();
+                if (p == null) return;
+
+                int v = p.GetValue(track);
+                if (v == shownValue) return;
+                shownValue = v;
+
+                double x    = XOf(p, v);
+                double xDef = XOf(p, p.DefValue);
+
+                if (bipolar)
+                {
+                    Canvas.SetLeft(fill, Math.Min(x, xDef));
+                    fill.Width = Math.Max(Math.Abs(x - xDef), 1);
+                }
+                else
+                {
+                    Canvas.SetLeft(fill, 0);
+                    fill.Width = x;
+                }
+                Canvas.SetLeft(defaultTick, Math.Min(xDef, width - 1));
+
+                string desc = null;
+                try { desc = p.DescribeValue(v); } catch { }
+                Root.ToolTip = $"{p.Name}: {(string.IsNullOrEmpty(desc) ? v.ToString() : desc)}" +
+                               "\nDrag to set · double-click to reset · wheel ±5 (Ctrl ±1)";
+            }
         }
 
         // Holds the per-button "on" colours so RefreshToggleVisual can recolour
@@ -600,7 +809,11 @@ namespace WDE.PedalGainMultiN
             IParameterGroup unused;
             soloParam       = FindParameter(ParameterGroupType.Track,  "Solo", out trackGroup);
             muteParam       = FindParameter(ParameterGroupType.Track,  "Mute", out unused);
+            volumeParam     = FindParameter(ParameterGroupType.Track,  "Volume", out unused);
+            panParam        = FindParameter(ParameterGroupType.Track,  "Pan", out unused);
+            monoParam       = FindParameter(ParameterGroupType.Track,  "Mono", out unused);
             masterMuteParam = FindParameter(ParameterGroupType.Global, "Master Mute", out unused);
+            gainParam       = FindParameter(ParameterGroupType.Global, "Gain", out unused);
             meterLinkOk     = true;
         }
 
@@ -711,10 +924,19 @@ namespace WDE.PedalGainMultiN
                 // truth (click handler, pattern editor, song load all land there).
                 RefreshToggleVisual(inMuteButtons[i], inMuteLabels[i], IsOn(muteParam, i));
                 RefreshToggleVisual(soloButtons[i],   soloLabels[i],   IsOn(soloParam, i));
+                RefreshToggleVisual(monoButtons[i],   monoLabels[i],   IsOn(monoParam, i));
             }
 
             // Mute button — same source-of-truth pattern.
             RefreshToggleVisual(muteButton, muteLabel, IsOn(masterMuteParam, 0));
+
+            // Faders follow their parameters (pattern playback, param window, undo).
+            for (int i = 0; i < shownChannels; i++)
+            {
+                volFaders[i]?.Refresh();
+                panFaders[i]?.Refresh();
+            }
+            masterFader?.Refresh();
 
             // Stereo output meter — hold-synchronized readout.
             float l = meterL;

@@ -3,22 +3,25 @@
 // Port of the managed (ReBuzz) machine "Pedal Gain Multi" to the classic
 // Buzz native machine interface (MachineInterface.h, MI_VERSION 66).
 //
-// v1.2 — channels are TRACKS
+// v1.3 — channel strips
 //
 //   Channels : one Buzz track per channel, 1..24 (new machines start with 6).
-//              Add/delete tracks in the parameter window or pattern editor;
-//              the input/output plugs follow the track count. Only existing
-//              tracks appear in the parameter window.
-//   Inputs   : one stereo input per track
-//   Output 0 : MASTER — all inputs with per-track Mute/Solo, × Gain, × Master Mute
-//   Output k : DIRECT k — input k × its Mute (same Inertia fade) × Gain.
-//              Solo and Master Mute act on the master mix only.
+//              Add/delete tracks in the parameter window, pattern editor or
+//              the GUI's −/+; the input/output plugs follow the track count.
+//   Per channel (track params): Solo, Mute, Volume (fader), Pan (balance),
+//              Mono (sums L+R to mono before the fader; v1.3.1)
+//   Output 0 : MASTER — Σ input × Mute × Solo × Volume × Pan, then × Gain
+//              (master fader) × Master Mute
+//   Output k : DIRECT — input k-1 ("Direct In k-1") × its Mute × Volume × Pan
+//              (post-fader, post-pan). Solo, Gain and Master Mute are
+//              master-only.
 //
-//   Global params : Gain, Master Mute, Inertia
-//   Track params  : Solo, Mute        (track k = channel k)
+//   All level controls (Gain, Volume, Pan) and the Mono switch glide to new
+//   values (~10 ms smoothing) so automation and slider moves don't click.
+//   Mutes keep their own Inertia fade.
 //
-//   • Peak meters (inputs pre-mute/solo, master L/R) exposed to the
-//     companion "Pedal Gain Multi N.GUI.dll" via HandleGUIMessage
+//   • Peak meters (inputs pre-fader, master L/R) exposed to the companion
+//     "Pedal Gain Multi N.GUI.dll" via HandleGUIMessage
 
 #include <math.h>
 #include <stdio.h>
@@ -30,6 +33,13 @@ static int const MaxChannels     = 24;
 static int const DefaultChannels = 6;    // track count given to NEW machines
 
 static float const FULL_SCALE = 32768.0f;   // Buzz ±32768 → meters 1.0 = 0 dBFS
+
+// Level smoothing (Gain / Volume / Pan): one-pole, ~10 ms time constant.
+static float const SMOOTH_SECONDS = 0.010f;
+
+// Pan (balance) range: 0 = hard left, 64 = centre, 128 = hard right.
+static int const PAN_CENTRE = 64;
+static int const PAN_MAX    = 128;
 
 // Machine data written by Save(). Its presence in Init() marks a machine that
 // is being loaded (song, template, clone) rather than freshly created.
@@ -52,13 +62,16 @@ enum
 
     P_SOLO = P_NUM_GLOBAL,      // track param 0
     P_MUTE,                     // track param 1
+    P_VOLUME,                   // track param 2   (appended in v1.3)
+    P_PAN,                      // track param 3   (appended in v1.3)
+    P_MONO,                     // track param 4   (appended in v1.3.1)
     P_COUNT,
     P_NUM_TRACK = P_COUNT - P_NUM_GLOBAL
 };
 
 // ── Parameter declarations ─────────────────────────────────────────────────
 static CMachineParameter const paraGain =
-{ pt_word, "Gain", "Gain in percent, applied to master and direct outs. 100 = unity, 200 = +6 dB.",
+{ pt_word, "Gain", "Master fader in percent (output 0 only). 100 = unity, 200 = +6 dB.",
   0, 200, 0xFFFF, MPF_STATE, 100 };
 
 static CMachineParameter const paraMasterMute =
@@ -77,10 +90,22 @@ static CMachineParameter const paraMute =
 { pt_switch, "Mute", "Mute this channel (master mix and its direct out)",
   -1, -1, SWITCH_NO, MPF_STATE, SWITCH_OFF };
 
+static CMachineParameter const paraVolume =
+{ pt_byte, "Volume", "Channel fader in percent (master mix and direct out). 100 = unity, 200 = +6 dB.",
+  0, 200, 0xFF, MPF_STATE, 100 };
+
+static CMachineParameter const paraPan =
+{ pt_byte, "Pan", "Channel balance (master mix and direct out). 0 = left, 64 = centre, 128 = right.",
+  0, PAN_MAX, 0xFF, MPF_STATE, PAN_CENTRE };
+
+static CMachineParameter const paraMono =
+{ pt_switch, "Mono", "Sum this channel to mono, (L+R)/2, before its fader and pan",
+  -1, -1, SWITCH_NO, MPF_STATE, SWITCH_OFF };
+
 static CMachineParameter const *pParameters[P_COUNT] =
 {
-    &paraGain, &paraMasterMute, &paraInertia,   // global
-    &paraSolo, &paraMute                         // track
+    &paraGain, &paraMasterMute, &paraInertia,                    // global
+    &paraSolo, &paraMute, &paraVolume, &paraPan, &paraMono        // track
 };
 
 // Value blocks. Layout MUST mirror pParameters (types + order).
@@ -95,11 +120,14 @@ struct tvals
 {
     byte solo;
     byte mute;
+    byte volume;
+    byte pan;
+    byte mono;
 };
 #pragma pack()
 
 static_assert(sizeof(gvals) == 5, "gvals must be packed");
-static_assert(sizeof(tvals) == 2, "tvals must be packed");
+static_assert(sizeof(tvals) == 5, "tvals must be packed");
 
 CMachineInfo const MacInfo =
 {
@@ -120,7 +148,7 @@ CMachineInfo const MacInfo =
 
 // ── Channel names (stable storage for GetChannelName) ──────────────────────
 static char g_inNames[MaxChannels][8];
-static char g_outNames[MaxChannels + 1][12];
+static char g_outNames[MaxChannels + 1][16];
 
 static void InitChannelNames()
 {
@@ -128,8 +156,10 @@ static void InitChannelNames()
     if (done) return;
     for (int i = 0; i < MaxChannels; i++)
     {
-        snprintf(g_inNames[i],      sizeof(g_inNames[i]),      "In %d",     i + 1);
-        snprintf(g_outNames[i + 1], sizeof(g_outNames[i + 1]), "Direct %d", i + 1);
+        // 0-based, matching Buzz's plug-menu indices and track numbers.
+        // Output 0 is the master, so input i's direct out is output i + 1.
+        snprintf(g_inNames[i],      sizeof(g_inNames[i]),      "In %d",        i);
+        snprintf(g_outNames[i + 1], sizeof(g_outNames[i + 1]), "Direct In %d", i);
     }
     snprintf(g_outNames[0], sizeof(g_outNames[0]), "Master");
     done = true;
@@ -182,6 +212,17 @@ private:
     bool  solo[MaxChannels]   = {};
     bool  inMute[MaxChannels] = {};
     bool  masterMute = false;
+    int   volumePct[MaxChannels];
+    int   panPos[MaxChannels];
+    bool  mono[MaxChannels] = {};
+
+    // Smoothed level state (audio thread only). curL/curR = Volume × balance,
+    // used by the master mix and the direct out; curGain = master fader.
+    float curL[MaxChannels];
+    float curR[MaxChannels];
+    float curMono[MaxChannels];     // 0 = stereo, 1 = mono (crossfaded)
+    float curGain          = 1.0f;
+    bool  levelsInitialized = false;
     int   inertiaMs = 25;
 
     // Ramp state (audio thread only).
@@ -210,8 +251,15 @@ mi::mi()
 
     for (int i = 0; i < MaxChannels; i++)
     {
-        tval[i].solo = SWITCH_NO;
-        tval[i].mute = SWITCH_NO;
+        tval[i].solo   = SWITCH_NO;
+        tval[i].mute   = SWITCH_NO;
+        tval[i].volume = 0xFF;
+        tval[i].pan    = 0xFF;
+        tval[i].mono   = SWITCH_NO;
+        volumePct[i] = 100;
+        panPos[i]    = PAN_CENTRE;
+        curL[i] = curR[i] = 1.0f;
+        curMono[i] = 0.0f;
         meterIn[i].store(0.0f, std::memory_order_relaxed);
     }
     meterL.store(0.0f, std::memory_order_relaxed);
@@ -259,12 +307,15 @@ void mi::SetNumTracks(int const n)
 
     int cur = numChannels.load(std::memory_order_acquire);
 
-    // Tracks being removed lose their host-side state, so drop ours too;
-    // otherwise re-adding a track could resurrect a stale Solo/Mute.
+    // Tracks being removed lose their host-side state, so reset ours too;
+    // otherwise re-adding a track could resurrect stale settings.
     for (int i = (n < 0 ? 0 : n); i < cur && i < MaxChannels; i++)
     {
-        solo[i]   = false;
-        inMute[i] = false;
+        solo[i]      = false;
+        inMute[i]    = false;
+        volumePct[i] = paraVolume.DefValue;
+        panPos[i]    = PAN_CENTRE;
+        mono[i]      = false;
     }
 
     ApplyChannelCount(n, false);
@@ -300,8 +351,11 @@ void mi::Tick()
     int channels = numChannels.load(std::memory_order_relaxed);
     for (int i = 0; i < channels; i++)
     {
-        if (tval[i].solo != SWITCH_NO) solo[i]   = tval[i].solo != SWITCH_OFF;
-        if (tval[i].mute != SWITCH_NO) inMute[i] = tval[i].mute != SWITCH_OFF;
+        if (tval[i].solo   != SWITCH_NO)          solo[i]      = tval[i].solo != SWITCH_OFF;
+        if (tval[i].mute   != SWITCH_NO)          inMute[i]    = tval[i].mute != SWITCH_OFF;
+        if (tval[i].volume != paraVolume.NoValue) volumePct[i] = tval[i].volume;
+        if (tval[i].pan    != paraPan.NoValue)    panPos[i]    = tval[i].pan;
+        if (tval[i].mono   != SWITCH_NO)          mono[i]      = tval[i].mono != SWITCH_OFF;
     }
 }
 
@@ -315,10 +369,25 @@ char const *mi::DescribeValue(int const param, int const value)
         snprintf(descBuf, sizeof(descBuf), "%d%% (%+.1f dB)", value, 20.0 * log10(value * 0.01));
         return descBuf;
 
+    case P_VOLUME:
+        if (value <= 0)
+            return "0% (-inf dB)";
+        snprintf(descBuf, sizeof(descBuf), "%d%% (%+.1f dB)", value, 20.0 * log10(value * 0.01));
+        return descBuf;
+
     case P_INERTIA:
         if (value <= 0)
             return "0 ms (instant)";
         snprintf(descBuf, sizeof(descBuf), "%d ms", value);
+        return descBuf;
+
+    case P_PAN:
+        if (value == PAN_CENTRE)
+            return "C";
+        if (value < PAN_CENTRE)
+            snprintf(descBuf, sizeof(descBuf), "L %d%%", (PAN_CENTRE - value) * 100 / PAN_CENTRE);
+        else
+            snprintf(descBuf, sizeof(descBuf), "R %d%%", (value - PAN_CENTRE) * 100 / (PAN_MAX - PAN_CENTRE));
         return descBuf;
     }
 
@@ -353,24 +422,65 @@ void mi::MultiWork(float const * const *inputs, float **outputs, int n)
     }
 }
 
+// Balance law for a stereo channel: centre = both sides at unity; turning
+// towards one side attenuates the other side linearly to zero.
+static inline void BalanceGains(int pan, float &l, float &r)
+{
+    if (pan <= PAN_CENTRE) { l = 1.0f; r = (float)pan / PAN_CENTRE; }
+    else                   { r = 1.0f; l = (float)(PAN_MAX - pan) / (PAN_MAX - PAN_CENTRE); }
+}
+
+// One-pole glide. Snaps onto the target once within 1e-4 (-80 dB): closer
+// than that, the per-sample step can fall below float precision near
+// gains of 1-2 and the value would stall a hair short of the target.
+static inline float Glide(float cur, float target, float k)
+{
+    cur += (target - cur) * k;
+    return fabsf(target - cur) < 1e-4f ? target : cur;
+}
+
 void mi::Process(float const * const *inputs, float **outputs, int n, int channels)
 {
     int sr = pMasterInfo->SamplesPerSec;
     if (sr > 0) cachedSr = sr;
     float decay = cachedSr > 0 ? expf(-2.302585f * n / cachedSr) : 0.95f;
 
-    float g = gainPct * 0.01f;   // 0..200 → 0..2.0
+    // Smoothing coefficient for Gain / Volume / Pan.
+    float k = cachedSr > 0 ? 1.0f - expf(-1.0f / (SMOOTH_SECONDS * cachedSr)) : 1.0f;
 
     float fadeSeconds = inertiaMs * 0.001f;
     float muteStep = (fadeSeconds > 0.0f && cachedSr > 0)
         ? 1.0f / (cachedSr * fadeSeconds)
         : 1.0f;
 
+    // Per-channel level targets.
+    float tgtL[MaxChannels], tgtR[MaxChannels];
+    for (int i = 0; i < MaxChannels; i++)
+    {
+        float v = volumePct[i] * 0.01f, bl, br;
+        BalanceGains(panPos[i], bl, br);
+        tgtL[i] = v * bl;
+        tgtR[i] = v * br;
+    }
+    float tgtGain = gainPct * 0.01f;
+
+    // First block after creation/load: start AT the targets (no fade-in).
     if (!inMuteInitialized)
     {
         for (int i = 0; i < MaxChannels; i++)
             currentInMuteGain[i] = inMute[i] ? 0.0f : 1.0f;
         inMuteInitialized = true;
+    }
+    if (!levelsInitialized)
+    {
+        for (int i = 0; i < MaxChannels; i++)
+        {
+            curL[i] = tgtL[i];
+            curR[i] = tgtR[i];
+            curMono[i] = mono[i] ? 1.0f : 0.0f;
+        }
+        curGain = tgtGain;
+        levelsInitialized = true;
     }
 
     // Master bus: output 0, or scratch if nothing is connected there.
@@ -389,8 +499,12 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
 
         if (in == nullptr)
         {
+            // Nothing to process: park every ramp at its target.
             meterIn[i].store(meterIn[i].load(std::memory_order_relaxed) * decay, std::memory_order_relaxed);
             currentInMuteGain[i] = inMute[i] ? 0.0f : 1.0f;
+            curL[i] = tgtL[i];
+            curR[i] = tgtR[i];
+            curMono[i] = mono[i] ? 1.0f : 0.0f;
             if (dir != nullptr)
                 for (int s = 0; s < n * 2; s++) dir[s] = 0.0f;
             continue;
@@ -400,6 +514,9 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         float effSoloGain = (anySolo && !solo[i]) ? 0.0f : 1.0f;
         float inTarget    = inMute[i] ? 0.0f : 1.0f;
         float inGain      = currentInMuteGain[i];
+        float cl = curL[i], cr = curR[i];
+        float tl = tgtL[i], tr = tgtR[i];
+        float cm = curMono[i], tm = mono[i] ? 1.0f : 0.0f;
 
         for (int s = 0; s < n; s++)
         {
@@ -409,18 +526,26 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
             if (inGain < inTarget)      inGain = fminf2(inGain + muteStep, inTarget);
             else if (inGain > inTarget) inGain = fmaxf2(inGain - muteStep, inTarget);
 
-            // Master mix: mute ramp × solo gate (Gain applied below).
-            float effG = inGain * effSoloGain;
-            master[2 * s]     += l * effG;
-            master[2 * s + 1] += r * effG;
+            cl = Glide(cl, tl, k);
+            cr = Glide(cr, tr, k);
+            cm = Glide(cm, tm, k);
 
-            // Direct out: this input × its mute ramp × Gain (solo and the
-            // master Mute do not apply).
+            // Channel strip: mono (crossfaded) → mute × fader × balance.
+            float avg = (l + r) * 0.5f;
+            float ml  = l + (avg - l) * cm;
+            float mr  = r + (avg - r) * cm;
+            float sl  = ml * inGain * cl;
+            float sr  = mr * inGain * cr;
+
+            // Master mix adds the solo gate (Gain applied below).
+            master[2 * s]     += sl * effSoloGain;
+            master[2 * s + 1] += sr * effSoloGain;
+
+            // Direct out: the channel strip as-is (post-fader, post-pan).
             if (dir != nullptr)
             {
-                float dg = inGain * g;
-                dir[2 * s]     = l * dg;
-                dir[2 * s + 1] = r * dg;
+                dir[2 * s]     = sl;
+                dir[2 * s + 1] = sr;
             }
 
             float a = fmaxf2(fabsf(l), fabsf(r));
@@ -428,19 +553,23 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         }
 
         currentInMuteGain[i] = inGain;
+        curL[i] = cl; curR[i] = cr; curMono[i] = cm;
         meterIn[i].store(fmaxf2(p / FULL_SCALE, meterIn[i].load(std::memory_order_relaxed) * decay),
                          std::memory_order_relaxed);
     }
 
-    // Channels above the current count: keep their ramps parked at target
-    // and let their meters fall, so re-enabling them later is glitch-free.
+    // Channels above the current count: park ramps at target and clear meters,
+    // so re-enabling them later is glitch-free.
     for (int i = channels; i < MaxChannels; i++)
     {
         currentInMuteGain[i] = inMute[i] ? 0.0f : 1.0f;
+        curL[i] = tgtL[i];
+        curR[i] = tgtR[i];
+        curMono[i] = mono[i] ? 1.0f : 0.0f;
         meterIn[i].store(0.0f, std::memory_order_relaxed);
     }
 
-    // Master: Gain × Master Mute ramp, collect peaks.
+    // Master: Gain (smoothed) × Master Mute ramp, collect peaks.
     float targetMuteGain = masterMute ? 0.0f : 1.0f;
     if (!muteInitialized)
     {
@@ -448,6 +577,7 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         muteInitialized = true;
     }
 
+    float g = curGain;
     float peakL = 0.0f, peakR = 0.0f;
     for (int s = 0; s < n; s++)
     {
@@ -455,6 +585,8 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
             currentMuteGain = fminf2(currentMuteGain + muteStep, targetMuteGain);
         else if (currentMuteGain > targetMuteGain)
             currentMuteGain = fmaxf2(currentMuteGain - muteStep, targetMuteGain);
+
+        g = Glide(g, tgtGain, k);
 
         float effG = g * currentMuteGain;
         float l = master[2 * s]     * effG;
@@ -466,6 +598,7 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         if (al > peakL) peakL = al;
         if (ar > peakR) peakR = ar;
     }
+    curGain = g;
 
     meterL.store(fmaxf2(peakL / FULL_SCALE, meterL.load(std::memory_order_relaxed) * decay), std::memory_order_relaxed);
     meterR.store(fmaxf2(peakR / FULL_SCALE, meterR.load(std::memory_order_relaxed) * decay), std::memory_order_relaxed);
