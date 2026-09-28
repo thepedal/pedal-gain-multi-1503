@@ -46,7 +46,7 @@
     <AssemblyTitle>Pedal Gain Multi N GUI</AssemblyTitle>
     <Company>WDE</Company>
     <Product>Pedal Gain Multi N</Product>
-    <Version>1.6.2</Version>
+    <Version>1.7.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

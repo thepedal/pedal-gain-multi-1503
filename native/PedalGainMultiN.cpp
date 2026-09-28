@@ -42,6 +42,15 @@
 //   • v4 replies add RMS (mean square since the last read) for every channel
 //     (pre and post) and each master side. Parameters and save data unchanged.
 //
+// v1.7 — loudness and correlation (backwards compatible)
+//   • The master is K-weighted (ITU-R BS.1770: high-shelf + RLB high-pass,
+//     coefficients derived for the running sample rate) and its energy is
+//     summed into 100 ms blocks, handed to meter windows for momentary,
+//     short-term and gated integrated loudness (EBU R128).
+//   • Running Σ L², Σ L·R, Σ R² on the master feed a stereo correlation meter.
+//   • New request GUIMSG_GET_METERS_V5 returns the v4 data plus a loudness /
+//     correlation trailer. The v3 (panel) and v4 requests are unchanged.
+//
 //   • Peak meters (inputs pre-fader, master L/R) exposed to the companion
 //     "Pedal Gain Multi N.GUI.dll" via HandleGUIMessage
 
@@ -115,6 +124,18 @@ static int const GUIMSG_GET_METERS_EX = 2;
 static int const GUI_PROTOCOL_EX      = 4;
 static int const METER_SLOTS          = 4;     // 0 = panel, 1..3 = meter windows
 
+// v1.7: meter window request with loudness + correlation.
+// Request : int32 GUIMSG_GET_METERS_V5, int32 slot (1..METER_SLOTS-1)
+// Reply   : exactly the v4 layout but with version 5, followed by
+//           int32 sampleRate, int32 blockCount B, int32 droppedBlocks,
+//           float blockEnergy[B],                  // 100 ms K-weighted blocks:
+//                                                  //   (Σ kL² + Σ kR²) / blockLen,
+//                                                  //   full scale = 1.0 → LUFS = -0.691 + 10·log10(e)
+//           float meanLL, float meanLR, float meanRR   // master, since last read
+static int const GUIMSG_GET_METERS_V5 = 3;
+static int const GUI_PROTOCOL_V5      = 5;
+static int const LOUD_BLOCK_CAP       = 64;    // 6.4 s of blocks per slot between reads
+
 // ── True-peak interpolator (master) ──────────────────────────────────────
 // 4 phases × 12 taps. Phase f interpolates the signal at (m - 6 + f/4) from
 // x[m-11..m] with a Blackman-windowed sinc, normalised to unity DC gain.
@@ -148,6 +169,37 @@ static void InitTruePeakFilter()
     done = true;
 }
 
+// ── K-weighting coefficients (ITU-R BS.1770-4) ───────────────────────────
+// Stage 1: high shelf (+4 dB above ~1.7 kHz, models the head); stage 2: RLB
+// high-pass (~38 Hz). Designed analytically for any sample rate; at 48 kHz
+// these reproduce the coefficients tabulated in BS.1770 (same derivation as
+// the widely used libebur128).
+static void KShelfCoefs(double rate, double &b0, double &b1, double &b2, double &a1, double &a2)
+{
+    const double PI_D = 3.14159265358979323846;
+    double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
+    double K  = tan(PI_D * f0 / rate);
+    double Vh = pow(10.0, G / 20.0);
+    double Vb = pow(Vh, 0.4996667741545416);
+    double a0 = 1.0 + K / Q + K * K;
+    b0 = (Vh + Vb * K / Q + K * K) / a0;
+    b1 = 2.0 * (K * K - Vh) / a0;
+    b2 = (Vh - Vb * K / Q + K * K) / a0;
+    a1 = 2.0 * (K * K - 1.0) / a0;
+    a2 = (1.0 - K / Q + K * K) / a0;
+}
+
+static void KHighPassCoefs(double rate, double &b0, double &b1, double &b2, double &a1, double &a2)
+{
+    const double PI_D = 3.14159265358979323846;
+    double f0 = 38.13547087602444, Q = 0.5003270373238773;
+    double K  = tan(PI_D * f0 / rate);
+    double a0 = 1.0 + K / Q + K * K;
+    b0 = 1.0; b1 = -2.0; b2 = 1.0;
+    a1 = 2.0 * (K * K - 1.0) / a0;
+    a2 = (1.0 - K / Q + K * K) / a0;
+}
+
 // Meter accumulator for one reader (slot). Guarded by mi::meterLock.
 struct MeterAcc
 {
@@ -157,11 +209,18 @@ struct MeterAcc
     double sqL, sqR;                     // Σ l², Σ r²
     double count;                        // samples accumulated
 
+    // v1.7 loudness + correlation (master, normalised to full scale = 1.0)
+    float  blocks[64];                   // completed 100 ms K-weighted block energies
+    int    nBlocks, dropped;
+    double cLL, cLR, cRR;                // Σ l², Σ l·r, Σ r²
+
     void Clear()
     {
         for (int i = 0; i < 24; i++) { prePeak[i] = postPeak[i] = 0.0f; preSq[i] = postSq[i] = 0.0; }
         tpL = tpR = 0.0f;
         sqL = sqR = count = 0.0;
+        nBlocks = dropped = 0;
+        cLL = cLR = cRR = 0.0;
     }
 };
 
@@ -346,6 +405,28 @@ private:
     float currentMuteGain   = 1.0f;
     bool  muteInitialized   = false;
     int   cachedSr          = 0;
+
+    // ── v1.7 loudness: K-weighting (two biquads per side) + 100 ms blocks ──
+    struct Biquad
+    {
+        double b0, b1, b2, a1, a2;       // a0 normalised to 1
+        double z1[2], z2[2];             // transposed direct form II state, per side
+        void Reset() { z1[0] = z1[1] = z2[0] = z2[1] = 0.0; }
+        inline double Run(int ch, double x)
+        {
+            double y = b0 * x + z1[ch];
+            z1[ch] = b1 * x - a1 * y + z2[ch];
+            z2[ch] = b2 * x - a2 * y;
+            return y;
+        }
+    };
+    Biquad kShelf, kHighPass;
+    int    kRate     = 0;                // sample rate the filters were designed for
+    int    blockLen  = 0;                // samples per 100 ms block
+    int    blockFill = 0;
+    double blockSum  = 0.0;
+
+    void DesignKWeighting(int rate);
 
     // Master-bus scratch, used when nothing is connected to output 0 so the
     // master meters still work.
@@ -586,6 +667,18 @@ static inline float Glide(float cur, float target, float k)
     return fabsf(target - cur) < 1e-4f ? target : cur;
 }
 
+void mi::DesignKWeighting(int rate)
+{
+    KShelfCoefs   (rate, kShelf.b0,    kShelf.b1,    kShelf.b2,    kShelf.a1,    kShelf.a2);
+    KHighPassCoefs(rate, kHighPass.b0, kHighPass.b1, kHighPass.b2, kHighPass.a1, kHighPass.a2);
+    kShelf.Reset();
+    kHighPass.Reset();
+    kRate     = rate;
+    blockLen  = (rate + 5) / 10;          // 100 ms
+    blockFill = 0;
+    blockSum  = 0.0;
+}
+
 void mi::Process(float const * const *inputs, float **outputs, int n, int channels)
 {
     int sr = pMasterInfo->SamplesPerSec;
@@ -750,6 +843,14 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
     float *tl = tpBuf[0] + TP_HIST;     // this block's master samples, after the history
     float *tr = tpBuf[1] + TP_HIST;
     float  msqL = 0.0f, msqR = 0.0f;
+
+    // Loudness blocks completed during this call (at most 1 per 100 ms, so
+    // 2 is ample for any block size up to MAX_BUFFER_LENGTH), and correlation.
+    if (cachedSr > 0 && cachedSr != kRate) DesignKWeighting(cachedSr);
+    float  doneBlocks[4];
+    int    nDone = 0;
+    double cLL = 0.0, cLR = 0.0, cRR = 0.0;
+    double const invFs = 1.0 / FULL_SCALE;
     for (int s = 0; s < n; s++)
     {
         if (currentMuteGain < targetMuteGain)
@@ -768,6 +869,26 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         tr[s] = r;
         msqL += l * l;
         msqR += r * r;
+
+        // Correlation sums (unweighted, full scale = 1.0).
+        double nl = l * invFs, nr = r * invFs;
+        cLL += nl * nl;
+        cLR += nl * nr;
+        cRR += nr * nr;
+
+        // K-weighted energy into 100 ms blocks.
+        if (blockLen > 0)
+        {
+            double kl = kHighPass.Run(0, kShelf.Run(0, nl));
+            double kr = kHighPass.Run(1, kShelf.Run(1, nr));
+            blockSum += kl * kl + kr * kr;
+            if (++blockFill >= blockLen)
+            {
+                if (nDone < 4) doneBlocks[nDone++] = (float)(blockSum / blockLen);
+                blockSum  = 0.0;
+                blockFill = 0;
+            }
+        }
     }
     curGain = g;
     float bTp[2] = { 0.0f, 0.0f };
@@ -813,6 +934,18 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         a.sqL   += msqL;
         a.sqR   += msqR;
         a.count += n;
+
+        if (sl > 0)   // loudness/correlation only for meter-window slots
+        {
+            for (int b = 0; b < nDone; b++)
+            {
+                if (a.nBlocks < LOUD_BLOCK_CAP) a.blocks[a.nBlocks++] = doneBlocks[b];
+                else                            a.dropped++;
+            }
+            a.cLL += cLL;
+            a.cLR += cLR;
+            a.cRR += cRR;
+        }
     }
     UnlockMeters();
 }
@@ -857,8 +990,9 @@ bool mi::HandleGUIMessage(CMachineDataOutput *pout, CMachineDataInput *pin)
         return true;
     }
 
-    if (id == GUIMSG_GET_METERS_EX)
+    if (id == GUIMSG_GET_METERS_EX || id == GUIMSG_GET_METERS_V5)
     {
+        bool v5 = id == GUIMSG_GET_METERS_V5;
         int slot = 0;
         pin->Read(slot);
         if (slot < 1 || slot >= METER_SLOTS) return false;
@@ -870,7 +1004,7 @@ bool mi::HandleGUIMessage(CMachineDataOutput *pout, CMachineDataInput *pin)
         UnlockMeters();
 
         double norm = a.count > 0 ? inv2 / a.count : 0.0;
-        pout->Write(GUI_PROTOCOL_EX);
+        pout->Write(v5 ? GUI_PROTOCOL_V5 : GUI_PROTOCOL_EX);
         pout->Write(channels);
         for (int i = 0; i < channels; i++)
         {
@@ -883,6 +1017,19 @@ bool mi::HandleGUIMessage(CMachineDataOutput *pout, CMachineDataInput *pin)
         pout->Write(a.tpR * inv);
         pout->Write((float)(a.sqL * norm));
         pout->Write((float)(a.sqR * norm));
+
+        if (v5)
+        {
+            double cn = a.count > 0 ? 1.0 / a.count : 0.0;
+            pout->Write(kRate);
+            pout->Write(a.nBlocks);
+            pout->Write(a.dropped);
+            for (int b = 0; b < a.nBlocks; b++)
+                pout->Write(a.blocks[b]);
+            pout->Write((float)(a.cLL * cn));
+            pout->Write((float)(a.cLR * cn));
+            pout->Write((float)(a.cRR * cn));
+        }
         return true;
     }
 

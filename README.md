@@ -76,6 +76,20 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
   - Small **M** / **S** badges under a channel show its mute and solo state, and a channel
     that isn't heard on the master (muted, or left out by someone else's solo) is dimmed.
   - It redraws at the display rate (about 60 fps) for smooth movement.
+- **Loudness and correlation (v1.7).** A strip at the bottom of the meter window measures
+  the master:
+  - **M** (momentary, 400 ms) and **S** (short-term, 3 s) as bars on an LU scale around
+    the target, blue below it and amber above.
+  - **I** (integrated) in LUFS and relative to the target, using the EBU R128 / BS.1770
+    gating: blocks below −70 LUFS are ignored, then blocks more than 10 LU below the
+    running average. **RESET** restarts the measurement.
+  - **TARGET** switches between −23 LUFS (EBU R128 broadcast) and −14 LUFS (streaming).
+  - **C** is stereo correlation from −1 to +1. +1 means mono-compatible, around 0 is wide
+    stereo, and below 0 means phase problems that will cancel in mono. It shows `--` in
+    silence.
+  - It measures from when the window opens (or RESET), on the master output after Gain and
+    Master Mute. Verified against the EBU Tech 3341 test signals to within 0.02 LU at both
+    44.1 and 48 kHz.
   - It closes itself when its machine is deleted or the song changes. There's one window
     per machine: pressing METERS again brings the existing one to the front.
   - It reads its own meter data, so it never affects the panel's meters.
@@ -196,9 +210,19 @@ The machine keeps a separate set of meter data for each reader (slot 0 for the p
 slots 1–3 for meter windows), so reading one never resets another. The panel's request
 and reply are unchanged from v1.5.
 
+**Loudness link (v1.7).** The meter window sends `int32 id` (3) and `int32 slot`. The reply
+(protocol v5) is the v4 reply with version 5, followed by `int32 sampleRate`, `int32 B`,
+`int32 dropped`, B × `float` 100 ms block energies, and the master means `LL`, `LR`, `RR`.
+The machine K-weights the master (BS.1770 high shelf plus high-pass, with coefficients
+derived for the running sample rate) and sums (kL² + kR²) into 100 ms blocks. LUFS =
+−0.691 + 10·log10(block energy). The window computes M, S and gated I from those blocks.
+
 **Compatibility:** v1.6 changes no parameters and no save data, so songs from v1.4 and
 v1.5 load unchanged. A v1.6 GUI paired with a v1.5 machine still works: the panel is
 unaffected, and the meter window shows a notice asking for the newer machine.
+v1.7 is the same: no parameter or save changes, and the v3 (panel) and v4 requests are
+unchanged. A v1.7 GUI with a v1.6 machine falls back to v4, and the loudness strip shows a
+notice.
 - The GUI rebuilds its rows whenever N changes.
 - Meter values are normalised so that 1.0 = 0 dBFS.
 
@@ -210,7 +234,7 @@ Button states are read from the parameters themselves, and clicks go through
 load a .NET 10 assembly. The source avoids `Math.Clamp` and `MathF`, which
 .NET Framework lacks.
 
-## Verify in Buzz 1503 (v1.6.2)
+## Verify in Buzz 1503 (v1.7.0)
 
 Not yet checked on a live install:
 
@@ -238,6 +262,13 @@ Not yet checked on a live install:
     - Readouts go amber above −6 dB.
     - Muting or soloing channels shows M/S badges and dims the channels you can't hear.
     - Movement looks smooth.
+11. **Loudness (v1.7).**
+    - The meter window has the loudness strip at the bottom.
+    - With music playing, M and S move and I settles after a few seconds.
+    - RESET restarts I.
+    - TARGET switches between T −23 and T −14, and the LU readout follows.
+12. **Correlation (v1.7).** The C bar sits near +1 on a mono source, lower on wide stereo,
+    and goes red below 0 if one side is inverted. It shows `--` in silence.
 
 ## Verified in Buzz 1503 (v1.5.0)
 
