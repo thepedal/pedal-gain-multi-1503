@@ -53,6 +53,16 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
     style), 3 s peak hold with a dB readout.
   - **Clip lights** latch red at 0 dBFS or above, on the bar end and the readout. Click
     any meter to clear all clip lights and peak holds.
+- **Meter window.** The **METERS** button on the OUT row opens a separate, resizable
+  window with large vertical meters for every channel and the master:
+  - **RMS** as a solid bar (300 ms integration), with the **peak** shown translucent above
+    it. The master shows true peak.
+  - A dB scale expanded near the top, a 3 s peak-hold line, latching clip lights, and
+    readouts of the held peak (bold) and current RMS.
+  - Its own PRE/POST switch and a CLEAR button. Clicking the meters also clears them.
+  - It closes itself when its machine is deleted or the song changes. There's one window
+    per machine: pressing METERS again brings the existing one to the front.
+  - It reads its own meter data, so it never affects the panel's meters.
 
 ### GUI controls
 
@@ -94,6 +104,7 @@ pedalgainmultin/
 │   └── sdk/MachineInterface.h     (fetched on first build — not in the repo)
 └── gui/
     ├── PedalGainMultiNGUI.cs      WPF meter/button panel (code-only, no XAML)
+    ├── PedalGainMultiNMeterWindow.cs  separate large meter window (v1.6)
     └── PedalGainMultiN.GUI.csproj net48 (Buzz 1503's .NET Framework 4 CLR)
 ```
 
@@ -159,6 +170,19 @@ reaches `HandleGUIMessage` on the C++ side.
   pre-fader and post-fader peak floats, then master true-peak L and R floats.
 - Every value is the highest peak since the previous request, and reading resets it.
   The GUI drops the first reply after the window opens, since it may hold old peaks.
+
+**Meter window link (v1.6).** The meter window sends a separate request: `int32 id` (2)
+and `int32 slot` (1–3). The reply (protocol v4) is `int32 version (4)`, `int32 N`, then
+N × {pre peak, post peak, pre mean square, post mean square}, then master true peak L/R
+and master mean square L/R. A channel's power is the average of its two sides.
+
+The machine keeps a separate set of meter data for each reader (slot 0 for the panel,
+slots 1–3 for meter windows), so reading one never resets another. The panel's request
+and reply are unchanged from v1.5.
+
+**Compatibility:** v1.6 changes no parameters and no save data, so songs from v1.4 and
+v1.5 load unchanged. A v1.6 GUI paired with a v1.5 machine still works: the panel is
+unaffected, and the meter window shows a notice asking for the newer machine.
 - The GUI rebuilds its rows whenever N changes.
 - Meter values are normalised so that 1.0 = 0 dBFS.
 
@@ -169,6 +193,19 @@ Button states are read from the parameters themselves, and clicks go through
 ".NET 10 or higher" rule: Buzz 1503 runs on the .NET Framework 4 CLR and cannot
 load a .NET 10 assembly. The source avoids `Math.Clamp` and `MathF`, which
 .NET Framework lacks.
+
+## Verify in Buzz 1503 (v1.6.0)
+
+Not yet checked on a live install:
+
+1. **Opening.** METERS (on the OUT row) opens the meter window. Pressing it again brings
+   the same window to the front. The window stays above Buzz and minimises with it.
+2. **Display.** Channel and master meters move, with RMS solid and peak translucent. The
+   readouts show the held peak and RMS. PRE/POST and CLEAR work.
+3. **Independence.** The panel's meters behave exactly as before while the window is open.
+4. **Channel changes.** Adding or deleting tracks updates the window's meter count.
+5. **Closing.** Deleting the machine, or loading or starting a new song, closes the window
+   without errors.
 
 ## Verified in Buzz 1503 (v1.5.0)
 

@@ -26,6 +26,8 @@
 //     style fall (≈ 11.8 dB/s) timed by the clock; 3 s peak hold; latching
 //     clip lights (click any meter to clear); PRE/POST channel metering;
 //     the master shows true peak.
+//   • v1.6: METERS button on the OUT row opens the separate meter window
+//     (PedalGainMultiNMeterWindow.cs). The panel itself is unchanged.
 //
 // Renders a compact meter stack at the top of the parameters window:
 //
@@ -515,6 +517,34 @@ namespace WDE.PedalGainMultiN
             masterFader = LevelFader(FADER_W - 8, H, () => gainParam, 0);
             Grid.SetColumn(masterFader.Root, 5);
             grid.Children.Add(masterFader.Root);
+
+            // Cols 6–7 — open the separate meter window (v1.6).
+            var metersText = new TextBlock
+            {
+                Text                = "METERS",
+                FontFamily          = Mono,
+                FontSize            = 8,
+                FontWeight          = FontWeights.Bold,
+                Foreground          = SoloOffFg,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment   = VerticalAlignment.Center
+            };
+            var meters = new Border
+            {
+                Height          = H + 2,
+                Margin          = new Thickness(6, 0, 2, 0),
+                Background      = SoloOffBg,
+                BorderBrush     = SoloBorder,
+                BorderThickness = new Thickness(1),
+                CornerRadius    = new CornerRadius(2),
+                Cursor          = Cursors.Hand,
+                ToolTip         = "Open the large meter window",
+                Child           = metersText
+            };
+            meters.MouseLeftButtonDown += (_, e) => { MeterWindow.ShowFor(imachine); e.Handled = true; };
+            Grid.SetColumn(meters, 6);
+            Grid.SetColumnSpan(meters, 2);
+            grid.Children.Add(meters);
 
             return grid;
         }

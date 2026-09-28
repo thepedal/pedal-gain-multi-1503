@@ -35,6 +35,13 @@
 //   • The master reports TRUE PEAK: 4x oversampled with a 48-tap windowed-sinc
 //     interpolator (BS.1770-style), catching inter-sample peaks.
 //
+// v1.6 — meter window support (backwards compatible)
+//   • Meter data is collected into independent SLOTS, so several readers never
+//     steal each other's peaks: slot 0 = the parameter panel (unchanged v3
+//     request), slots 1..3 = meter windows (new v4 request).
+//   • v4 replies add RMS (mean square since the last read) for every channel
+//     (pre and post) and each master side. Parameters and save data unchanged.
+//
 //   • Peak meters (inputs pre-fader, master L/R) exposed to the companion
 //     "Pedal Gain Multi N.GUI.dll" via HandleGUIMessage
 
@@ -93,8 +100,20 @@ static inline float LevelGain(int code)
 //           N × { float prePeak, float postPeak }, float truePeakL, float truePeakR
 //           All values are linear (1.0 = 0 dBFS) peaks since the previous poll;
 //           reading resets them.
-static int const GUIMSG_GET_METERS    = 1;
+static int const GUIMSG_GET_METERS    = 1;     // slot 0, protocol v3 (parameter panel)
 static int const GUI_PROTOCOL_VERSION = 3;
+
+// v1.6: meter-window request.
+// Request : int32 GUIMSG_GET_METERS_EX, int32 slot (1..METER_SLOTS-1)
+// Reply   : int32 version (4), int32 channel count N,
+//           N × { float prePeak, float postPeak, float preMeanSq, float postMeanSq },
+//           float truePeakL, float truePeakR, float meanSqL, float meanSqR
+//           Peaks: linear, 1.0 = 0 dBFS. Mean squares: linear power, 1.0 = 0 dBFS;
+//           a channel's power is the average of its two sides, (l² + r²) / 2.
+//           All values cover the time since this slot was last read; reading resets.
+static int const GUIMSG_GET_METERS_EX = 2;
+static int const GUI_PROTOCOL_EX      = 4;
+static int const METER_SLOTS          = 4;     // 0 = panel, 1..3 = meter windows
 
 // ── True-peak interpolator (master) ──────────────────────────────────────
 // 4 phases × 12 taps. Phase f interpolates the signal at (m - 6 + f/4) from
@@ -129,12 +148,22 @@ static void InitTruePeakFilter()
     done = true;
 }
 
-// Lock-free "max since last read": audio thread raises, GUI thread exchanges to 0.
-static inline void AtomicMax(std::atomic<float> &a, float v)
+// Meter accumulator for one reader (slot). Guarded by mi::meterLock.
+struct MeterAcc
 {
-    float cur = a.load(std::memory_order_relaxed);
-    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
-}
+    float  prePeak[24], postPeak[24];
+    double preSq[24],   postSq[24];      // Σ (l² + r²) / 2, in raw Buzz units²
+    float  tpL, tpR;                     // true peak, raw units
+    double sqL, sqR;                     // Σ l², Σ r²
+    double count;                        // samples accumulated
+
+    void Clear()
+    {
+        for (int i = 0; i < 24; i++) { prePeak[i] = postPeak[i] = 0.0f; preSq[i] = postSq[i] = 0.0; }
+        tpL = tpR = 0.0f;
+        sqL = sqR = count = 0.0;
+    }
+};
 
 // ── Parameter indices (Buzz numbers globals first, then track params) ──────
 enum
@@ -211,6 +240,7 @@ struct tvals
 #pragma pack()
 
 static_assert(sizeof(gvals) == 5, "gvals must be packed");
+static_assert(MaxChannels == 24, "MeterAcc arrays are sized for 24 channels");
 static_assert(sizeof(tvals) == 5, "tvals must be packed");
 
 CMachineInfo const MacInfo =
@@ -321,12 +351,15 @@ private:
     // master meters still work.
     float scratch[MAX_BUFFER_LENGTH * 2];
 
-    // Meters — peaks since the last GUI poll (linear, 1.0 = 0 dBFS).
-    // Audio thread raises them (AtomicMax); the GUI read resets them.
-    std::atomic<float> prePeak[MaxChannels];
-    std::atomic<float> postPeak[MaxChannels];
-    std::atomic<float> tpPeakL;
-    std::atomic<float> tpPeakR;
+    // Meters — one accumulator per reader slot. The audio thread merges each
+    // block into every slot; a GUI read copies and clears its own slot. A tiny
+    // spinlock keeps each read a consistent snapshot; it is held for a few
+    // hundred nanoseconds at most, once per block.
+    MeterAcc         meterAcc[METER_SLOTS];
+    std::atomic_flag meterLock;
+
+    void LockMeters()   { while (meterLock.test_and_set(std::memory_order_acquire)) {} }
+    void UnlockMeters() { meterLock.clear(std::memory_order_release); }
 
     // True-peak history + working buffer per master side (audio thread only).
     float tpBuf[2][TP_HIST + MAX_BUFFER_LENGTH];
@@ -350,11 +383,10 @@ mi::mi()
         panPos[i]    = PAN_CENTRE;
         curL[i] = curR[i] = 1.0f;
         curMono[i] = 0.0f;
-        prePeak[i].store(0.0f, std::memory_order_relaxed);
-        postPeak[i].store(0.0f, std::memory_order_relaxed);
     }
-    tpPeakL.store(0.0f, std::memory_order_relaxed);
-    tpPeakR.store(0.0f, std::memory_order_relaxed);
+    meterLock.clear();
+    for (int sl = 0; sl < METER_SLOTS; sl++)
+        meterAcc[sl].Clear();
     for (int c = 0; c < 2; c++)
         for (int j = 0; j < TP_HIST; j++)
             tpBuf[c][j] = 0.0f;
@@ -405,6 +437,18 @@ void mi::SetNumTracks(int const n)
 
     // Tracks being removed lose their host-side state, so reset ours too;
     // otherwise re-adding a track could resurrect stale settings.
+    if (n < cur)
+    {
+        LockMeters();
+        for (int sl = 0; sl < METER_SLOTS; sl++)
+            for (int i = (n < 0 ? 0 : n); i < cur && i < MaxChannels; i++)
+            {
+                MeterAcc &a = meterAcc[sl];
+                a.prePeak[i] = a.postPeak[i] = 0.0f;
+                a.preSq[i]   = a.postSq[i]   = 0.0;
+            }
+        UnlockMeters();
+    }
     for (int i = (n < 0 ? 0 : n); i < cur && i < MaxChannels; i++)
     {
         solo[i]      = false;
@@ -601,6 +645,10 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
     for (int i = 0; i < channels; i++)
         if (solo[i]) { anySolo = true; break; }
 
+    // This block's meter statistics (merged into every slot at the end).
+    float  bPre[MaxChannels] = {}, bPost[MaxChannels] = {};
+    double bPreSq[MaxChannels] = {}, bPostSq[MaxChannels] = {};
+
     for (int i = 0; i < channels; i++)
     {
         float const *in  = (inputs  != nullptr) ? inputs[i]      : nullptr;
@@ -619,7 +667,8 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
             continue;
         }
 
-        float p = 0.0f, pp = 0.0f;   // pre- and post-fader peaks
+        float p = 0.0f, pp = 0.0f;       // pre- and post-fader peaks
+        float psq = 0.0f, ppsq = 0.0f;   // pre- and post-fader Σ (l² + r²)
         float soloTarget = (anySolo && !solo[i]) ? 0.0f : 1.0f;
         float soloGain   = currentSoloGain[i];
         float inTarget    = inMute[i] ? 0.0f : 1.0f;
@@ -665,13 +714,17 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
             if (a > p) p = a;
             float b = fmaxf2(fabsf(sl), fabsf(sr));
             if (b > pp) pp = b;
+            psq  += l * l + r * r;
+            ppsq += sl * sl + sr * sr;
         }
 
         currentInMuteGain[i] = inGain;
         currentSoloGain[i]   = soloGain;
         curL[i] = cl; curR[i] = cr; curMono[i] = cm;
-        AtomicMax(prePeak[i],  p  / FULL_SCALE);
-        AtomicMax(postPeak[i], pp / FULL_SCALE);
+        bPre[i]    = p;
+        bPost[i]   = pp;
+        bPreSq[i]  = 0.5 * psq;
+        bPostSq[i] = 0.5 * ppsq;
     }
 
     // Channels above the current count: park ramps at target and clear meters,
@@ -683,8 +736,6 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         curL[i] = tgtL[i];
         curR[i] = tgtR[i];
         curMono[i] = mono[i] ? 1.0f : 0.0f;
-        prePeak[i].store(0.0f, std::memory_order_relaxed);
-        postPeak[i].store(0.0f, std::memory_order_relaxed);
     }
 
     // Master: Gain (smoothed) × Master Mute ramp, collect peaks.
@@ -698,6 +749,7 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
     float g = curGain;
     float *tl = tpBuf[0] + TP_HIST;     // this block's master samples, after the history
     float *tr = tpBuf[1] + TP_HIST;
+    float  msqL = 0.0f, msqR = 0.0f;
     for (int s = 0; s < n; s++)
     {
         if (currentMuteGain < targetMuteGain)
@@ -714,8 +766,11 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         master[2 * s + 1] = r;
         tl[s] = l;
         tr[s] = r;
+        msqL += l * l;
+        msqR += r * r;
     }
     curGain = g;
+    float bTp[2] = { 0.0f, 0.0f };
 
     // True peak: 4x oversampled peak of each master side.
     for (int c = 0; c < 2; c++)
@@ -738,8 +793,28 @@ void mi::Process(float const * const *inputs, float **outputs, int n, int channe
         // Carry the last TP_HIST samples into the next block.
         for (int j = 0; j < TP_HIST; j++)
             x[j] = x[n + j];
-        AtomicMax(c == 0 ? tpPeakL : tpPeakR, peak / FULL_SCALE);
+        bTp[c] = peak;
     }
+
+    // Merge this block into every reader slot.
+    LockMeters();
+    for (int sl = 0; sl < METER_SLOTS; sl++)
+    {
+        MeterAcc &a = meterAcc[sl];
+        for (int i = 0; i < channels; i++)
+        {
+            if (bPre[i]  > a.prePeak[i])  a.prePeak[i]  = bPre[i];
+            if (bPost[i] > a.postPeak[i]) a.postPeak[i] = bPost[i];
+            a.preSq[i]  += bPreSq[i];
+            a.postSq[i] += bPostSq[i];
+        }
+        if (bTp[0] > a.tpL) a.tpL = bTp[0];
+        if (bTp[1] > a.tpR) a.tpR = bTp[1];
+        a.sqL   += msqL;
+        a.sqR   += msqR;
+        a.count += n;
+    }
+    UnlockMeters();
 }
 
 char const *mi::GetChannelName(bool input, int index)
@@ -757,18 +832,57 @@ bool mi::HandleGUIMessage(CMachineDataOutput *pout, CMachineDataInput *pin)
     int id = 0;
     pin->Read(id);
 
+    int channels = numChannels.load(std::memory_order_relaxed);
+    float const inv  = 1.0f / FULL_SCALE;
+    double const inv2 = 1.0 / ((double)FULL_SCALE * FULL_SCALE);
+
     if (id == GUIMSG_GET_METERS)
     {
-        int channels = numChannels.load(std::memory_order_relaxed);
+        // Parameter panel: slot 0, v3 layout (unchanged since v1.5).
+        MeterAcc a;
+        LockMeters();
+        a = meterAcc[0];
+        meterAcc[0].Clear();
+        UnlockMeters();
+
         pout->Write(GUI_PROTOCOL_VERSION);
         pout->Write(channels);
         for (int i = 0; i < channels; i++)
         {
-            pout->Write(prePeak[i].exchange(0.0f, std::memory_order_relaxed));
-            pout->Write(postPeak[i].exchange(0.0f, std::memory_order_relaxed));
+            pout->Write(a.prePeak[i]  * inv);
+            pout->Write(a.postPeak[i] * inv);
         }
-        pout->Write(tpPeakL.exchange(0.0f, std::memory_order_relaxed));
-        pout->Write(tpPeakR.exchange(0.0f, std::memory_order_relaxed));
+        pout->Write(a.tpL * inv);
+        pout->Write(a.tpR * inv);
+        return true;
+    }
+
+    if (id == GUIMSG_GET_METERS_EX)
+    {
+        int slot = 0;
+        pin->Read(slot);
+        if (slot < 1 || slot >= METER_SLOTS) return false;
+
+        MeterAcc a;
+        LockMeters();
+        a = meterAcc[slot];
+        meterAcc[slot].Clear();
+        UnlockMeters();
+
+        double norm = a.count > 0 ? inv2 / a.count : 0.0;
+        pout->Write(GUI_PROTOCOL_EX);
+        pout->Write(channels);
+        for (int i = 0; i < channels; i++)
+        {
+            pout->Write(a.prePeak[i]  * inv);
+            pout->Write(a.postPeak[i] * inv);
+            pout->Write((float)(a.preSq[i]  * norm));
+            pout->Write((float)(a.postSq[i] * norm));
+        }
+        pout->Write(a.tpL * inv);
+        pout->Write(a.tpR * inv);
+        pout->Write((float)(a.sqL * norm));
+        pout->Write((float)(a.sqR * norm));
         return true;
     }
 
