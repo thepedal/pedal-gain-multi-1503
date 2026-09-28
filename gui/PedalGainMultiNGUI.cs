@@ -31,6 +31,8 @@
 //   • v1.6.1: on opening, widens Buzz's parameter window if it is too narrow
 //     to show the whole panel (Buzz 1503 opens it at a fixed width).
 //     Clip lights go out 2 s after the last over instead of latching.
+//   • v1.6.2: panel meters use the meter window's scale shape and zone
+//     colours (MeterScale), with the colours fixed to dB positions.
 //
 // Renders a compact meter stack at the top of the parameters window:
 //
@@ -198,21 +200,12 @@ namespace WDE.PedalGainMultiN
 
         static Brush Freeze(Brush b) { b.Freeze(); return b; }
 
-        // Green → yellow → red gradient with break points at -12 dB and -3 dB.
-        static LinearGradientBrush LevelGradient()
-        {
-            float yp = Norm(-12f), rp = Norm(-3f);
-            var b = new LinearGradientBrush
-                { StartPoint = new Point(0, 0), EndPoint = new Point(1, 0) };
-            b.GradientStops.Add(new GradientStop(Color.FromRgb( 30, 175,  55), 0.0));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb( 30, 175,  55), yp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(205, 185,   0), yp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(205, 185,   0), rp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(215,  45,  30), rp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(215,  45,  30), 1.0));
-            b.Freeze();
-            return b;
-        }
+        // Green → yellow → red zones (-12 / -3 dB), shared with the meter window.
+        // Mapped in absolute units along the full meter length, so a bar's
+        // colours depend on its level — before v1.6.2 the gradient was
+        // stretched over the lit part of the bar, so quiet bars showed red.
+        static LinearGradientBrush LevelGradient() =>
+            MeterScale.ZoneBrush(new Point(0, 0), new Point(W, 0), MeterScale.PanelFrac);
 
         // ── Construction ─────────────────────────────────────────────────────
         public PedalGainMultiNGUI()
@@ -748,7 +741,8 @@ namespace WDE.PedalGainMultiN
             var canvas = new Canvas { Width = W, Height = 11 };
             Grid.SetColumn(canvas, 3);
 
-            int[] marks = { -48, -36, -24, -12, -6, -3, 0 };
+            // Spaced for the expanded-near-the-top scale (shared with the meter window).
+            int[] marks = { -40, -30, -20, -12, -6, -3, 0 };
             foreach (int db in marks)
             {
                 var t = new TextBlock
@@ -1126,9 +1120,10 @@ namespace WDE.PedalGainMultiN
         // net48 has neither Math.Clamp nor MathF.
         static float Clamp(float v, float lo, float hi) => v < lo ? lo : (v > hi ? hi : v);
 
-        // Map a dBFS value to a 0→1 position (used by both bars and scale).
+        // Map a dBFS value to a 0→1 position (bars, hold line and scale).
+        // v1.6.2: same expanded-near-the-top shape as the meter window.
         static float Norm(float db) =>
-            Clamp((db - DB_MIN) / -DB_MIN, 0f, 1f);
+            Clamp((float)MeterScale.PanelFrac(db), 0f, 1f);
 
         static float LinToDb(float lin) =>
             lin < 1e-6f ? DB_MIN : 20f * (float)Math.Log10(lin);

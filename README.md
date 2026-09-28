@@ -41,7 +41,10 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
 - **Smooth level changes.** Gain, Volume and Pan glide to new values (about 10 ms), so
   automation and fader moves don't click or zipper. Mutes keep their Inertia fade.
 - **Inertia** 0 … 500 ms (default 25). The fade time shared by every mute and solo.
-- **Metering:**
+- **Metering:** the panel and the meter window share one scale shape (expanded near the
+  top, so the last few dB are easy to read) and one set of colour zones (green below
+  −12 dB, yellow to −3 dB, red above). The colours are fixed to dB positions, so a
+  quiet signal shows only green.
   - **Channel meters** switch between **PRE** (raw input) and **POST** (after Mono, Mute,
     Volume and Pan) with the PRE/POST button in the IN header.
   - **Master meters** show **true peak**: 4× oversampled, so peaks between samples are
@@ -65,6 +68,14 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
     the last over), and
     readouts of the held peak (bold) and current RMS.
   - Its own PRE/POST switch and a CLEAR button. Clicking the meters also clears them.
+  - The master pair sits in its own shaded MASTER section. The area above 0 dBFS is
+    tinted red, and the scale ticks are drawn over the bars so levels can be read against
+    them.
+  - Readouts are colour-coded: amber above −6 dB, red on a clip, faint in silence. The
+    RMS readout is blank in silence.
+  - Small **M** / **S** badges under a channel show its mute and solo state, and a channel
+    that isn't heard on the master (muted, or left out by someone else's solo) is dimmed.
+  - It redraws at the display rate (about 60 fps) for smooth movement.
   - It closes itself when its machine is deleted or the song changes. There's one window
     per machine: pressing METERS again brings the existing one to the front.
   - It reads its own meter data, so it never affects the panel's meters.
@@ -199,7 +210,7 @@ Button states are read from the parameters themselves, and clicks go through
 load a .NET 10 assembly. The source avoids `Math.Clamp` and `MathF`, which
 .NET Framework lacks.
 
-## Verify in Buzz 1503 (v1.6.1)
+## Verify in Buzz 1503 (v1.6.2)
 
 Not yet checked on a live install:
 
@@ -218,6 +229,15 @@ Not yet checked on a live install:
    keeps going over keeps them lit.
 8. **Meter window legend (v1.6.1).** The grey legend shows as three lines beside PRE and
    CLEAR and is fully readable at the window's default width.
+9. **Panel meters (v1.6.2).** A quiet signal shows only green, and yellow and red appear
+   only near the top. The scale reads −40 −30 −20 −12 −6 −3 0, with more room near 0 dB.
+10. **Meter window look (v1.6.2).**
+    - Unlit clip boxes are grey with a faint red edge.
+    - Ticks show over the bars, and there's no −50 label.
+    - The master pair is in a shaded MASTER section, and the area above 0 dB is tinted.
+    - Readouts go amber above −6 dB.
+    - Muting or soloing channels shows M/S badges and dims the channels you can't hear.
+    - Movement looks smooth.
 
 ## Verified in Buzz 1503 (v1.5.0)
 

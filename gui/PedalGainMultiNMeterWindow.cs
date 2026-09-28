@@ -16,6 +16,13 @@
 //   • Paired with a pre-v1.6 machine it shows a notice instead of meters.
 //
 // Everything is drawn in one custom-rendered element for speed.
+//
+// v1.6.2 visual pass: neutral clip boxes when off, scale ticks drawn over the
+// bars, tidier/colour-coded readouts, a distinct MASTER section, a tinted
+// headroom zone above 0 dBFS, no crowded -50 label, M/S badges and dimming
+// for channels not heard on the master, and redraw at the display rate.
+// MeterScale (below) is shared with the parameter panel so both use the same
+// scale shape and colours.
 
 using System;
 using System.Collections.Generic;
@@ -70,7 +77,7 @@ namespace WDE.PedalGainMultiN
 
         readonly IMachine        machine;
         readonly MeterBridge     bridge;
-        readonly DispatcherTimer timer;
+        bool running;             // subscribed to CompositionTarget.Rendering
         readonly TextBlock       prePostText;
         readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
         double lastTick;
@@ -147,10 +154,9 @@ namespace WDE.PedalGainMultiN
             dock.Children.Add(bridge);
             Content = dock;
 
-            // ── Polling ──
-            timer = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
-            timer.Tick += (_, __) => Poll();
-            timer.Start();
+            // ── Polling + redraw at the display rate (capped near 60 fps) ──
+            CompositionTarget.Rendering += OnFrame;
+            running = true;
 
             // ── Lifetime: close with the machine or the song ──
             try
@@ -166,7 +172,7 @@ namespace WDE.PedalGainMultiN
 
             Closed += (_, __) =>
             {
-                timer.Stop();
+                Stop();
                 open.Remove(machine);
                 try
                 {
@@ -175,6 +181,31 @@ namespace WDE.PedalGainMultiN
                 }
                 catch { }
             };
+        }
+
+        // Solo/Mute track parameters, for the M/S badges and dimming.
+        IParameter soloParam, muteParam;
+
+        void ReadChannelStates(int n)
+        {
+            try
+            {
+                if (soloParam == null || muteParam == null)
+                    foreach (var g in machine.ParameterGroups)
+                        if (g != null && g.Type == ParameterGroupType.Track && g.Parameters != null)
+                            foreach (var p in g.Parameters)
+                            {
+                                if (p?.Name == "Solo") soloParam = p;
+                                if (p?.Name == "Mute") muteParam = p;
+                            }
+
+                for (int i = 0; i < n && i < MaxChannels; i++)
+                {
+                    bridge.Soloed[i] = soloParam != null && soloParam.GetValue(i) != 0;
+                    bridge.Muted[i]  = muteParam != null && muteParam.GetValue(i) != 0;
+                }
+            }
+            catch { /* badges are cosmetic */ }
         }
 
         string MachineName()
@@ -195,14 +226,29 @@ namespace WDE.PedalGainMultiN
             return 6;
         }
 
+        // CompositionTarget.Rendering is a static event: always unsubscribe,
+        // or the window would be kept alive after closing.
+        void Stop()
+        {
+            if (!running) return;
+            CompositionTarget.Rendering -= OnFrame;
+            running = false;
+        }
+
+        void OnFrame(object sender, EventArgs e)
+        {
+            if (clock.Elapsed.TotalSeconds - lastTick < 1.0 / 62) return;   // ~60 fps cap
+            Poll();
+        }
+
         void OnMachineRemoved(IMachine m)
         {
-            if (ReferenceEquals(m, machine)) { timer.Stop(); Close(); }
+            if (ReferenceEquals(m, machine)) { Stop(); Close(); }
         }
 
         void OnBuzzPropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            if (e.PropertyName == "Song") { timer.Stop(); Close(); }
+            if (e.PropertyName == "Song") { Stop(); Close(); }
         }
 
         // ── Poll the machine and feed the bridge ──────────────────────────────
@@ -226,7 +272,7 @@ namespace WDE.PedalGainMultiN
                 if (everOk)
                 {
                     // Machine gone (or unreachable) — give it ~1 s, then close.
-                    if (++failures > 30) { timer.Stop(); Close(); }
+                    if (++failures > 60) { Stop(); Close(); }
                     bridge.Feed(null, 0, dt);
                 }
                 else
@@ -241,6 +287,7 @@ namespace WDE.PedalGainMultiN
             everOk   = true;
             failures = 0;
             bridge.Notice = null;
+            ReadChannelStates(n);
 
             if (discardNext) { discardNext = false; bridge.SetChannelCount(n); return; }
 
@@ -280,13 +327,68 @@ namespace WDE.PedalGainMultiN
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // MeterScale — scale shape and colours shared by the meter window and the
+    // parameter panel, so both always agree.
+    // ══════════════════════════════════════════════════════════════════════════
+    static class MeterScale
+    {
+        // dB → 0..1 height, expanded near the top like a console meter bridge.
+        // The window's scale runs to +3 dBFS (headroom for overs).
+        static readonly double[] Db   = { -60, -50,  -40,  -30,  -24,  -18,  -12,   -9,   -6,   -3,    0,   3 };
+        static readonly double[] Fr   = { 0.0, 0.06, 0.14, 0.25, 0.33, 0.43, 0.56, 0.64, 0.73, 0.84, 0.95, 1.0 };
+
+        public static double Frac(double db)
+        {
+            if (db <= Db[0]) return 0;
+            if (db >= Db[Db.Length - 1]) return 1;
+            for (int i = 1; i < Db.Length; i++)
+                if (db <= Db[i])
+                    return Fr[i - 1] + (db - Db[i - 1]) / (Db[i] - Db[i - 1]) * (Fr[i] - Fr[i - 1]);
+            return 1;
+        }
+
+        // Same shape, but ending at 0 dBFS (the panel's bars stop at 0 dB,
+        // with the clip light at the end).
+        public static double PanelFrac(double db) => Math.Min(1.0, Frac(db) / Frac(0));
+
+        // Zone colours: green below -12, yellow -12..-3, red above -3 dBFS.
+        public static readonly Color Green  = Color.FromRgb( 60, 200,  90);
+        public static readonly Color Yellow = Color.FromRgb(230, 200,  50);
+        public static readonly Color Red    = Color.FromRgb(235,  60,  45);
+        public const double YellowFromDb = -12, RedFromDb = -3;
+
+        // Hard-edged zone gradient along a line from `from` (−∞ end) to `to` (top end),
+        // in absolute coordinates, so a bar's colours depend on level, not on its length.
+        public static LinearGradientBrush ZoneBrush(Point from, Point to, Func<double, double> frac, byte alpha = 255)
+        {
+            var b = new LinearGradientBrush
+            {
+                MappingMode = BrushMappingMode.Absolute,
+                StartPoint  = from,
+                EndPoint    = to
+            };
+            double fy = frac(YellowFromDb), fr = frac(RedFromDb);
+            Color g = Color.FromArgb(alpha, Green.R,  Green.G,  Green.B);
+            Color y = Color.FromArgb(alpha, Yellow.R, Yellow.G, Yellow.B);
+            Color r = Color.FromArgb(alpha, Red.R,    Red.G,    Red.B);
+            b.GradientStops.Add(new GradientStop(g, 0));
+            b.GradientStops.Add(new GradientStop(g, fy));
+            b.GradientStops.Add(new GradientStop(y, fy));
+            b.GradientStops.Add(new GradientStop(y, fr));
+            b.GradientStops.Add(new GradientStop(r, fr));
+            b.GradientStops.Add(new GradientStop(r, 1));
+            b.Freeze();
+            return b;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // MeterBridge — draws every meter in one OnRender pass.
     // ══════════════════════════════════════════════════════════════════════════
     sealed class MeterBridge : FrameworkElement
     {
         const int    MaxChannels   = 24;
         const double DB_MIN        = -60.0;
-        const double DB_TOP        = 3.0;          // headroom above 0 dBFS, so overs show
         const double FALL_DB_PER_S = 20.0 / 1.7;   // IEC 60268-18 style fall-back
         const double HOLD_SECONDS  = 3.0;
         const double RMS_TAU       = 0.300;        // RMS integration time constant
@@ -294,6 +396,10 @@ namespace WDE.PedalGainMultiN
 
         public bool   PostFader;
         public string Notice;
+
+        // Channel state for badges / dimming (fed by the window each frame).
+        public readonly bool[] Soloed = new bool[MaxChannels];
+        public readonly bool[] Muted  = new bool[MaxChannels];
 
         int channels = 6;
 
@@ -380,37 +486,37 @@ namespace WDE.PedalGainMultiN
             public double RmsDb => MeanSq > 1e-12 ? 10.0 * Math.Log10(MeanSq) : DB_MIN;
         }
 
-        // ── Scale: dB → 0..1 height, expanded near the top like a console bridge ──
-        static readonly double[] ScaleDb   = { -60, -50, -40, -30, -24, -18, -12, -9,   -6,   -3,   0,    3 };
-        static readonly double[] ScaleFrac = { 0.0, 0.06, 0.14, 0.25, 0.33, 0.43, 0.56, 0.64, 0.73, 0.84, 0.95, 1.0 };
-        static readonly int[]    TickDb    = { 0, -3, -6, -9, -12, -18, -24, -30, -40, -50, -60 };
+        // Scale ticks; -50 keeps its tick but not its label (too close to -60).
+        static readonly int[] TickDb   = { 0, -3, -6, -9, -12, -18, -24, -30, -40, -50, -60 };
+        static bool Labelled(int db) => db != -50;
 
-        public static double Frac(double db)
-        {
-            if (db <= ScaleDb[0]) return 0;
-            if (db >= ScaleDb[ScaleDb.Length - 1]) return 1;
-            for (int i = 1; i < ScaleDb.Length; i++)
-                if (db <= ScaleDb[i])
-                    return ScaleFrac[i - 1] + (db - ScaleDb[i - 1]) / (ScaleDb[i] - ScaleDb[i - 1]) * (ScaleFrac[i] - ScaleFrac[i - 1]);
-            return 1;
-        }
+        public static double Frac(double db) => MeterScale.Frac(db);
 
         // ── Drawing resources ─────────────────────────────────────────────────
-        static readonly Brush TrackBrush = Frozen(new SolidColorBrush(Color.FromRgb(38, 38, 44)));
-        static readonly Brush TextBrush  = Frozen(new SolidColorBrush(Color.FromRgb(200, 200, 205)));
-        static readonly Brush DimBrush   = Frozen(new SolidColorBrush(Color.FromRgb(120, 120, 130)));
-        static readonly Brush ClipOn     = Frozen(new SolidColorBrush(Color.FromRgb(235, 45, 35)));
-        static readonly Brush ClipOff    = Frozen(new SolidColorBrush(Color.FromRgb(60, 30, 30)));
-        static readonly Brush HoldBrush  = Frozen(new SolidColorBrush(Colors.White));
-        static readonly Pen   TickPen    = FrozenPen(new Pen(new SolidColorBrush(Color.FromArgb(60, 255, 255, 255)), 1));
-        static readonly Pen   ZeroPen    = FrozenPen(new Pen(new SolidColorBrush(Color.FromArgb(140, 255, 90, 80)), 1));
+        static readonly Brush TrackBrush   = Frozen(new SolidColorBrush(Color.FromRgb(38, 38, 44)));
+        static readonly Brush MasterPanel  = Frozen(new SolidColorBrush(Color.FromRgb(33, 33, 40)));
+        static readonly Brush TextBrush    = Frozen(new SolidColorBrush(Color.FromRgb(200, 200, 205)));
+        static readonly Brush DimBrush     = Frozen(new SolidColorBrush(Color.FromRgb(120, 120, 130)));
+        static readonly Brush FaintBrush   = Frozen(new SolidColorBrush(Color.FromRgb( 78,  78,  88)));
+        static readonly Brush AmberBrush   = Frozen(new SolidColorBrush(Color.FromRgb(235, 180,  60)));
+        static readonly Brush ClipOn       = Frozen(new SolidColorBrush(Color.FromRgb(235,  45,  35)));
+        static readonly Brush ClipOff      = Frozen(new SolidColorBrush(Color.FromRgb( 46,  46,  52)));
+        static readonly Pen   ClipOffPen   = FrozenPen(new Pen(new SolidColorBrush(Color.FromArgb( 90, 235,  60,  45)), 1));
+        static readonly Brush HeadroomTint = Frozen(new SolidColorBrush(Color.FromArgb( 34, 235,  60,  45)));
+        static readonly Brush DimOverlay   = Frozen(new SolidColorBrush(Color.FromArgb(150,  24,  24,  28)));
+        static readonly Brush HoldBrush    = Frozen(new SolidColorBrush(Colors.White));
+        static readonly Brush MuteBadge    = Frozen(new SolidColorBrush(Color.FromRgb(215,  55,  45)));
+        static readonly Brush SoloBadge    = Frozen(new SolidColorBrush(Color.FromRgb(225, 175,  40)));
+        static readonly Brush BadgeText    = Frozen(new SolidColorBrush(Color.FromRgb( 20,  20,  25)));
+        static readonly Pen   TickPen      = FrozenPen(new Pen(new SolidColorBrush(Color.FromArgb( 48, 255, 255, 255)), 1));
+        static readonly Pen   ZeroPen      = FrozenPen(new Pen(new SolidColorBrush(Color.FromArgb(160, 255,  90,  80)), 1));
+        static readonly Pen   DividerPen   = FrozenPen(new Pen(new SolidColorBrush(Color.FromArgb( 70, 255, 255, 255)), 1));
         static readonly Typeface Mono     = new Typeface(new FontFamily("Consolas"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
         static readonly Typeface MonoBold = new Typeface(new FontFamily("Consolas"), FontStyles.Normal, FontWeights.Bold,   FontStretches.Normal);
 
         static Brush Frozen(Brush b) { b.Freeze(); return b; }
         static Pen   FrozenPen(Pen p) { p.Freeze(); return p; }
 
-        // Zone colours: green below -12, yellow -12..-3, red above -3 dBFS.
         LinearGradientBrush zoneBrush, zoneBrushDim;
         double zoneTop = -1, zoneBottom = -1;
 
@@ -418,30 +524,8 @@ namespace WDE.PedalGainMultiN
         {
             if (zoneBrush != null && top == zoneTop && bottom == zoneBottom) return;
             zoneTop = top; zoneBottom = bottom;
-            zoneBrush    = MakeZoneBrush(top, bottom, 255);
-            zoneBrushDim = MakeZoneBrush(top, bottom, 110);
-        }
-
-        static LinearGradientBrush MakeZoneBrush(double top, double bottom, byte alpha)
-        {
-            var green  = Color.FromArgb(alpha,  60, 200,  90);
-            var yellow = Color.FromArgb(alpha, 230, 200,  50);
-            var red    = Color.FromArgb(alpha, 235,  60,  45);
-            double f12 = Frac(-12), f3 = Frac(-3);
-            var b = new LinearGradientBrush
-            {
-                MappingMode = BrushMappingMode.Absolute,
-                StartPoint  = new Point(0, bottom),
-                EndPoint    = new Point(0, top)
-            };
-            b.GradientStops.Add(new GradientStop(green,  0));
-            b.GradientStops.Add(new GradientStop(green,  f12));
-            b.GradientStops.Add(new GradientStop(yellow, f12));
-            b.GradientStops.Add(new GradientStop(yellow, f3));
-            b.GradientStops.Add(new GradientStop(red,    f3));
-            b.GradientStops.Add(new GradientStop(red,    1));
-            b.Freeze();
-            return b;
+            zoneBrush    = MeterScale.ZoneBrush(new Point(0, bottom), new Point(0, top), MeterScale.Frac, 255);
+            zoneBrushDim = MeterScale.ZoneBrush(new Point(0, bottom), new Point(0, top), MeterScale.Frac, 110);
         }
 
         FormattedText Text(string s, double size, Brush brush, bool bold = false)
@@ -456,6 +540,14 @@ namespace WDE.PedalGainMultiN
             db <= DB_MIN + 0.5 ? "-∞" : (db > 0.05 ? "+" + db.ToString("F1", CultureInfo.InvariantCulture)
                                                    : db.ToString("F1", CultureInfo.InvariantCulture));
 
+        // Is channel c heard on the master? (not muted, and not cut by someone else's solo)
+        bool Audible(int c)
+        {
+            bool anySolo = false;
+            for (int i = 0; i < channels; i++) if (Soloed[i]) { anySolo = true; break; }
+            return !Muted[c] && (!anySolo || Soloed[c]);
+        }
+
         // ── Render ────────────────────────────────────────────────────────────
         protected override void OnRender(DrawingContext dc)
         {
@@ -468,75 +560,128 @@ namespace WDE.PedalGainMultiN
                 return;
             }
 
-            const double scaleW = 34, gap = 14, pad = 8;
-            const double readH = 28, clipH = 7, labelH = 16;
+            const double scaleW = 34, gap = 16, pad = 8;
+            const double captionH = 12, readH = 28, clipH = 7, labelH = 15, badgeH = 12;
 
             int cols = channels + 2;
             double avail = W - pad * 2 - scaleW - gap;
             double colW  = Math.Max(10, Math.Min(52, avail / cols));
             double barW  = Math.Max(6, colW - 4);
 
-            double top    = pad + readH + clipH + 3;
-            double bottom = H - pad - labelH;
+            double top    = pad + captionH + readH + clipH + 3;
+            double bottom = H - pad - labelH - badgeH;
             if (bottom - top < 40) return;
             double hgt = bottom - top;
+            double y0  = bottom - Frac(0) * hgt;       // 0 dBFS line
 
             EnsureZoneBrushes(top, bottom);
 
-            // Scale + ticks across the whole bridge.
-            double right = pad + scaleW + channels * colW + gap + 2 * colW;
+            double chanLeft   = pad + scaleW;
+            double masterLeft = chanLeft + channels * colW + gap;
+            double right      = masterLeft + 2 * colW;
+            Func<int, double> colX = c => (c < channels ? chanLeft + c * colW : masterLeft + (c - channels) * colW) + (colW - barW) / 2;
+
+            // 1. Master section: panel, divider, caption.
+            dc.DrawRectangle(MasterPanel, null, new Rect(masterLeft - 4, pad, 2 * colW + 8, H - 2 * pad));
+            double divX = Math.Round(masterLeft - gap / 2) + 0.5;
+            dc.DrawLine(DividerPen, new Point(divX, pad), new Point(divX, H - pad));
+            var cap = Text("MASTER", 9, DimBrush, bold: true);
+            dc.DrawText(cap, new Point(masterLeft + colW - cap.Width / 2, pad));
+
+            // 2. Tracks + headroom tint.
+            for (int c = 0; c < cols; c++)
+            {
+                double x = colX(c);
+                dc.DrawRectangle(TrackBrush,   null, new Rect(x, top, barW, hgt));
+                dc.DrawRectangle(HeadroomTint, null, new Rect(x, top, barW, Math.Max(0, y0 - top)));
+            }
+
+            // 3. Bars: peak (translucent) then RMS (solid); dim channels not heard on the master.
+            for (int c = 0; c < cols; c++)
+            {
+                bool isMaster = c >= channels;
+                var  m = meters[isMaster ? MaxChannels + (c - channels) : c];
+                double x = colX(c);
+
+                double yPk  = bottom - Frac(m.PeakDb) * hgt;
+                double yRms = bottom - Frac(m.RmsDb)  * hgt;
+                if (m.PeakDb > DB_MIN + 0.1) dc.DrawRectangle(zoneBrushDim, null, new Rect(x, yPk,  barW, bottom - yPk));
+                if (m.RmsDb  > DB_MIN + 0.1) dc.DrawRectangle(zoneBrush,    null, new Rect(x, yRms, barW, bottom - yRms));
+
+                if (!isMaster && !Audible(c))
+                    dc.DrawRectangle(DimOverlay, null, new Rect(x, top, barW, hgt));
+            }
+
+            // 4. Scale ticks, drawn faintly OVER the bars; labels at the left.
             foreach (int t in TickDb)
             {
                 double y = Math.Round(bottom - Frac(t) * hgt) + 0.5;
-                dc.DrawLine(t == 0 ? ZeroPen : TickPen, new Point(pad + scaleW - 4, y), new Point(right, y));
+                dc.DrawLine(t == 0 ? ZeroPen : TickPen, new Point(chanLeft - 4, y), new Point(right, y));
+                if (!Labelled(t)) continue;
                 var ft = Text(t.ToString(CultureInfo.InvariantCulture), 10, DimBrush);
-                dc.DrawText(ft, new Point(pad + scaleW - 7 - ft.Width, y - ft.Height / 2));
+                dc.DrawText(ft, new Point(chanLeft - 7 - ft.Width, y - ft.Height / 2));
             }
 
             bool narrow = colW < 30;
             double fontPk  = narrow ? 8.5 : 10.5;
             double fontRms = narrow ? 7.5 : 9;
 
+            // 5. Hold lines, clip lights, readouts, labels, badges.
             for (int c = 0; c < cols; c++)
             {
                 bool isMaster = c >= channels;
                 int  mi = isMaster ? MaxChannels + (c - channels) : c;
                 var  m  = meters[mi];
+                double x  = colX(c);
+                double cx = x + barW / 2;
 
-                double x = pad + scaleW + c * colW + (isMaster ? gap : 0) + (colW - barW) / 2;
-
-                // Track
-                dc.DrawRectangle(TrackBrush, null, new Rect(x, top, barW, hgt));
-
-                // Peak (translucent) then RMS (solid) on top of it.
-                double yPk  = bottom - Frac(m.PeakDb) * hgt;
-                double yRms = bottom - Frac(m.RmsDb)  * hgt;
-                if (m.PeakDb > DB_MIN + 0.1) dc.DrawRectangle(zoneBrushDim, null, new Rect(x, yPk,  barW, bottom - yPk));
-                if (m.RmsDb  > DB_MIN + 0.1) dc.DrawRectangle(zoneBrush,    null, new Rect(x, yRms, barW, bottom - yRms));
-
-                // Peak-hold line
                 if (m.HoldDb > DB_MIN + 0.5)
                 {
                     double yH = Math.Round(bottom - Frac(m.HoldDb) * hgt);
                     dc.DrawRectangle(HoldBrush, null, new Rect(x, yH - 1, barW, 2));
                 }
 
-                // Clip light
-                dc.DrawRectangle(m.Clipped ? ClipOn : ClipOff, null, new Rect(x, top - clipH - 2, barW, clipH));
+                // Clip light: neutral box with a faint red edge when off.
+                var clipRect = new Rect(x + 0.5, top - clipH - 2 + 0.5, barW - 1, clipH - 1);
+                if (m.Clipped) dc.DrawRectangle(ClipOn,  null,       clipRect);
+                else           dc.DrawRectangle(ClipOff, ClipOffPen, clipRect);
 
-                // Readouts: held peak (bold) and current RMS.
-                var pkText = Text(Db(m.HoldDb), fontPk, m.Clipped ? ClipOn : TextBrush, bold: true);
-                dc.DrawText(pkText, new Point(x + barW / 2 - pkText.Width / 2, pad));
-                var rmsText = Text(Db(m.RmsDb), fontRms, DimBrush);
-                dc.DrawText(rmsText, new Point(x + barW / 2 - rmsText.Width / 2, pad + readH / 2 + 1));
+                // Readouts: held peak (colour-coded) and current RMS (blank in silence).
+                double ry = pad + captionH;
+                bool silent = m.HoldDb <= DB_MIN + 0.5;
+                Brush pkBrush = m.Clipped ? ClipOn : silent ? FaintBrush : m.HoldDb > -6 ? AmberBrush : TextBrush;
+                var pkText = Text(Db(m.HoldDb), fontPk, pkBrush, bold: !silent);
+                dc.DrawText(pkText, new Point(cx - pkText.Width / 2, ry));
+                if (m.RmsDb > DB_MIN + 0.5)
+                {
+                    var rmsText = Text(Db(m.RmsDb), fontRms, DimBrush);
+                    dc.DrawText(rmsText, new Point(cx - rmsText.Width / 2, ry + readH / 2 + 1));
+                }
 
                 // Label
                 string label = isMaster ? (narrow ? "" : "Out ") + (mi == MaxChannels ? "L" : "R")
                                         : (narrow ? c.ToString(CultureInfo.InvariantCulture) : "In " + c);
-                var lt = Text(label, narrow ? 9 : 10, isMaster ? TextBrush : DimBrush, bold: isMaster);
-                dc.DrawText(lt, new Point(x + barW / 2 - lt.Width / 2, bottom + 3));
-            }
+                var lt = Text(label, narrow ? 9 : 10, isMaster ? TextBrush : (Audible(c) ? DimBrush : FaintBrush), bold: isMaster);
+                dc.DrawText(lt, new Point(cx - lt.Width / 2, bottom + 3));
 
+                // M / S badges under the label (channels only).
+                if (!isMaster && (Muted[c] || Soloed[c]))
+                {
+                    const double bw = 11, bh = 10;
+                    int count = (Muted[c] ? 1 : 0) + (Soloed[c] ? 1 : 0);
+                    double bx = cx - (count * bw + (count - 1) * 2) / 2;
+                    double by = bottom + labelH + 1;
+                    if (Muted[c])  { DrawBadge(dc, "M", MuteBadge, bx, by, bw, bh); bx += bw + 2; }
+                    if (Soloed[c]) { DrawBadge(dc, "S", SoloBadge, bx, by, bw, bh); }
+                }
+            }
+        }
+
+        void DrawBadge(DrawingContext dc, string letter, Brush bg, double x, double y, double w, double h)
+        {
+            dc.DrawRectangle(bg, null, new Rect(x, y, w, h));
+            var t = Text(letter, 8, BadgeText, bold: true);
+            dc.DrawText(t, new Point(x + w / 2 - t.Width / 2, y + h / 2 - t.Height / 2));
         }
     }
 }
