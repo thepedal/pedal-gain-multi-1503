@@ -28,6 +28,9 @@
 //     the master shows true peak.
 //   • v1.6: METERS button on the OUT row opens the separate meter window
 //     (PedalGainMultiNMeterWindow.cs). The panel itself is unchanged.
+//   • v1.6.1: on opening, widens Buzz's parameter window if it is too narrow
+//     to show the whole panel (Buzz 1503 opens it at a fixed width).
+//     Clip lights go out 2 s after the last over instead of latching.
 //
 // Renders a compact meter stack at the top of the parameters window:
 //
@@ -156,9 +159,11 @@ namespace WDE.PedalGainMultiN
 
         // Ballistics: IEC 60268-18 style digital peak meter — instant attack,
         // fall 20 dB in ~1.7 s (≈ 11.8 dB/s). Peak hold: 3 s, then falls at
-        // the same rate. Clip lights latch at >= 0 dBFS until cleared.
+        // the same rate. Clip lights come on at >= 0 dBFS and go out 2 s after
+        // the last over (or immediately when a meter is clicked).
         const double FALL_DB_PER_S = 20.0 / 1.7;
         const double HOLD_SECONDS  = 3.0;
+        const double CLIP_SECONDS  = 2.0;
 
         // ── Cached, frozen brushes ───────────────────────────────────────────
         static readonly Brush TrackBrush     = Freeze(new SolidColorBrush(Color.FromRgb(34,  34,  38)));
@@ -218,8 +223,42 @@ namespace WDE.PedalGainMultiN
                 Interval = TimeSpan.FromMilliseconds(33)   // ~30 fps
             };
             timer.Tick += Tick;
-            Loaded   += (_, __) => { meterLinkOk = true; discardNextPoll = true; timer.Start(); };
+            Loaded   += (_, __) =>
+            {
+                meterLinkOk = true; discardNextPoll = true; timer.Start();
+                // After Buzz has finished sizing its parameter window, widen it
+                // if the panel doesn't fit (Buzz 1503 opens it at a fixed width).
+                Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, new Action(FitHostWindow));
+            };
             Unloaded += (_, __) => timer.Stop();
+        }
+
+        // Widen the hosting parameter window so the whole panel is visible.
+        // Only ever grows the window; a window that is already wide enough
+        // (or that the user has made wider) is left alone.
+        void FitHostWindow()
+        {
+            try
+            {
+                var win = Window.GetWindow(this);
+                var client = win?.Content as FrameworkElement;
+                if (win == null || client == null) return;
+
+                // Natural (unclipped) width of the panel.
+                Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                double need = DesiredSize.Width;
+                InvalidateMeasure();   // let the normal layout pass run again
+
+                // Where the panel's right edge would be, in the window's client area.
+                Point left  = TranslatePoint(new Point(0, 0), client);
+                double right = left.X + need;
+                double spare = Math.Min(Math.Max(left.X, 4), 16);   // keep a margin like the left one
+
+                double deficit = right + spare - client.ActualWidth;
+                if (deficit > 0.5)
+                    win.Width = win.ActualWidth + Math.Ceiling(deficit);
+            }
+            catch { /* sizing is cosmetic — never break the panel over it */ }
         }
 
         // ── Layout helpers ───────────────────────────────────────────────────
@@ -644,14 +683,14 @@ namespace WDE.PedalGainMultiN
 
         // ── MeterView — one meter's widgets + ballistics ──────────────────────
         // Fed with the exact peak since the previous poll; handles fall-back,
-        // peak hold and the latching clip light using real elapsed time.
+        // peak hold and the clip light (off 2 s after the last over) using real elapsed time.
         sealed class MeterView
         {
             public readonly Canvas    Canvas;
             public readonly TextBlock Readout;
             readonly Rectangle bar, hold, clip;
 
-            double levelDb = DB_MIN, holdDb = DB_MIN, holdAge;
+            double levelDb = DB_MIN, holdDb = DB_MIN, holdAge, clipAge;
             bool   clipped;
             string shownText;
             bool   shownClip;
@@ -665,6 +704,7 @@ namespace WDE.PedalGainMultiN
             {
                 holdDb  = DB_MIN;
                 holdAge = 0;
+                clipAge = 0;
                 clipped = false;
             }
 
@@ -679,7 +719,9 @@ namespace WDE.PedalGainMultiN
                 else if ((holdAge += dt) > HOLD_SECONDS)
                     holdDb = Math.Max(holdDb - fall, DB_MIN);
 
-                if (peakLin >= 1.0f) clipped = true;
+                // Clip light: on at an over, off CLIP_SECONDS after the last one.
+                if (peakLin >= 1.0f) { clipped = true; clipAge = 0; }
+                else if (clipped && (clipAge += dt) > CLIP_SECONDS) clipped = false;
 
                 bar.Width = Clamp(Norm((float)levelDb) * W, 0f, W);
                 Canvas.SetLeft(hold, Clamp(Norm((float)holdDb) * W - 1f, 0f, W - 2f));

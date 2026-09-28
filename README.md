@@ -51,13 +51,18 @@ signature; the native interface does (`MIF_MULTI_IO` + `MultiWork`).
     no short peak is missed.
   - **Ballistics:** instant rise, falls about 12 dB/s (20 dB in 1.7 s, IEC 60268-18
     style), 3 s peak hold with a dB readout.
-  - **Clip lights** latch red at 0 dBFS or above, on the bar end and the readout. Click
-    any meter to clear all clip lights and peak holds.
+  - **Clip lights** turn red at 0 dBFS or above, on the bar end and the readout, and go
+    out 2 s after the last over. Any new over restarts the 2 s. Click any meter to clear
+    all clip lights and peak holds at once.
+- **Parameter window width.** When the panel opens, it widens Buzz's parameter window if
+  that's too narrow to show everything (Buzz 1503 opens it at a fixed width). It never
+  makes a window narrower.
 - **Meter window.** The **METERS** button on the OUT row opens a separate, resizable
   window with large vertical meters for every channel and the master:
   - **RMS** as a solid bar (300 ms integration), with the **peak** shown translucent above
     it. The master shows true peak.
-  - A dB scale expanded near the top, a 3 s peak-hold line, latching clip lights, and
+  - A dB scale expanded near the top, a 3 s peak-hold line, clip lights (out 2 s after
+    the last over), and
     readouts of the held peak (bold) and current RMS.
   - Its own PRE/POST switch and a CLEAR button. Clicking the meters also clears them.
   - It closes itself when its machine is deleted or the song changes. There's one window
@@ -194,7 +199,7 @@ Button states are read from the parameters themselves, and clicks go through
 load a .NET 10 assembly. The source avoids `Math.Clamp` and `MathF`, which
 .NET Framework lacks.
 
-## Verify in Buzz 1503 (v1.6.0)
+## Verify in Buzz 1503 (v1.6.1)
 
 Not yet checked on a live install:
 
@@ -206,6 +211,13 @@ Not yet checked on a live install:
 4. **Channel changes.** Adding or deleting tracks updates the window's meter count.
 5. **Closing.** Deleting the machine, or loading or starting a new song, closes the window
    without errors.
+6. **Panel width (v1.6.1).** A new instance's parameter window opens wide enough to show
+   the whole panel, including MONO and METERS. A window you've made wider stays as it is.
+7. **Clip lights (v1.6.1).** On a signal that goes over 0 dBFS and then drops back, the
+   clip lights in the panel and the meter window go out about 2 s later. A signal that
+   keeps going over keeps them lit.
+8. **Meter window legend (v1.6.1).** The grey legend shows as three lines beside PRE and
+   CLEAR and is fully readable at the window's default width.
 
 ## Verified in Buzz 1503 (v1.5.0)
 

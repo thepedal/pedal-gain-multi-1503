@@ -7,8 +7,9 @@
 //   • Reads its own meter slot (GUI message v4, slot 1), so it never steals
 //     peaks from the parameter panel (slot 0, v3) — the panel is unchanged.
 //   • Each meter shows RMS (solid, 300 ms integration) with the peak above it
-//     (translucent), a 3 s peak-hold line, a latching clip light and numeric
-//     peak-hold / RMS readouts. Master meters show TRUE PEAK.
+//     (translucent), a 3 s peak-hold line, a clip light and numeric
+//     peak-hold / RMS readouts. Master meters show TRUE PEAK. Clip lights
+//     go out 2 s after the last over.
 //   • PRE/POST switch for the channel meters; click anywhere on the meters (or
 //     Clear) to reset holds and clip lights.
 //   • Closes itself when its machine is deleted or the song changes.
@@ -84,9 +85,9 @@ namespace WDE.PedalGainMultiN
             this.machine = machine;
 
             Title         = MachineName() + " — Meters";
-            Width         = Math.Max(260, 70 + (DefaultChannels(machine) + 2) * 34);
+            Width         = Math.Max(280, 70 + (DefaultChannels(machine) + 2) * 34);
             Height        = 380;
-            MinWidth      = 200;
+            MinWidth      = 250;   // buttons + three-line legend always fit
             MinHeight     = 220;
             ShowInTaskbar = false;
             Background    = new SolidColorBrush(Color.FromRgb(24, 24, 28));
@@ -125,12 +126,15 @@ namespace WDE.PedalGainMultiN
             clear.Margin = new Thickness(6, 0, 0, 0);
             bar.Children.Add(clear);
 
+            // Legend: three short lines so it fits beside the buttons without
+            // the window having to be widened.
             bar.Children.Add(new TextBlock
             {
-                Text              = "solid = RMS (300 ms) · translucent = peak · master = true peak",
+                Text              = "solid = RMS (300 ms)\ntranslucent = peak\nmaster = true peak",
                 Foreground        = new SolidColorBrush(Color.FromRgb(130, 130, 140)),
                 FontFamily        = new FontFamily("Consolas"),
-                FontSize          = 10,
+                FontSize          = 9,
+                LineHeight        = 11,
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin            = new Thickness(10, 0, 0, 0)
             });
@@ -286,6 +290,7 @@ namespace WDE.PedalGainMultiN
         const double FALL_DB_PER_S = 20.0 / 1.7;   // IEC 60268-18 style fall-back
         const double HOLD_SECONDS  = 3.0;
         const double RMS_TAU       = 0.300;        // RMS integration time constant
+        const double CLIP_SECONDS  = 2.0;          // clip light goes out 2 s after the last over
 
         public bool   PostFader;
         public string Notice;
@@ -347,10 +352,10 @@ namespace WDE.PedalGainMultiN
         sealed class MeterState
         {
             public double PeakDb = DB_MIN, HoldDb = DB_MIN, MeanSq;
-            double holdAge;
+            double holdAge, clipAge;
             public bool Clipped;
 
-            public void Reset() { HoldDb = DB_MIN; holdAge = 0; Clipped = false; }
+            public void Reset() { HoldDb = DB_MIN; holdAge = 0; clipAge = 0; Clipped = false; }
 
             public void Update(float peakLin, float meanSq, double dt)
             {
@@ -363,7 +368,8 @@ namespace WDE.PedalGainMultiN
                 else if ((holdAge += dt) > HOLD_SECONDS)
                     HoldDb = Math.Max(HoldDb - fall, DB_MIN);
 
-                if (peakLin >= 1.0f) Clipped = true;
+                if (peakLin >= 1.0f) { Clipped = true; clipAge = 0; }
+                else if (Clipped && (clipAge += dt) > CLIP_SECONDS) Clipped = false;
 
                 // Exponential RMS integration of the mean square (τ = 300 ms).
                 double a = 1.0 - Math.Exp(-dt / RMS_TAU);
